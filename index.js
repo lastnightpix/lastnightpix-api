@@ -52,7 +52,11 @@ app.post('/upload', upload.single('image'), async (req, res) => {
 
   const tempPath = req.file.path;
   const originalName = req.file.originalname || `upload-${Date.now()}.jpg`;
-  const s3Key = `faces/${Date.now()}-${originalName}`;
+  // make a flat key (no folders) and sanitize the filename
+const safeName = (originalName || `upload-${Date.now()}.jpg`)
+  .replace(/\s+/g, '_');
+const s3Key = `${Date.now()}-${safeName}`; //
+
 
   try {
     const fileBuffer = fs.readFileSync(tempPath);
