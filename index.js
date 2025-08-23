@@ -5,7 +5,7 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const AWS = require('aws-sdk');
-const fetch = require('node-fetch'); // for /match-by-url
+const fetch = require('node-fetch'); // for match-by-url
 
 const app = express();
 app.use(cors());
@@ -33,18 +33,29 @@ function safeUnlink(p) { try { fs.unlinkSync(p); } catch (_) {} }
 function sanitizeName(name) {
   return (name || `upload-${Date.now()}.jpg`)
     .replace(/\s+/g, '_')
-    .replace(/[^a-zA-Z0-9_.\-:]/g, '_');
+    .replace(/[^a-zA-Z0-9_.\-:\/]/g, '_');
 }
 
 app.get('/health', (_req, res) => res.send('ok'));
 
-// Index (admin) — upload event photo and index face(s)
+/** ---------- EVENT HELPERS ----------
+ * We’ll prefix event photos like event-photos/<EVENT>/<FILENAME>.
+ * upload:   accepts ?event=BroadwayAug22 (optional)
+ * match*:   accepts ?event=BroadwayAug22 to FILTER results to that prefix
+ */
+function eventPrefix(event) {
+  return event ? `event-photos/${event}/` : `event-photos/default/`;
+}
+
+// ------- Admin: upload/index event photos -------
 app.post('/upload', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded. Field must be "image".' });
+  const event = (req.query.event || '').trim();
+  const prefix = eventPrefix(event);
 
   const tempPath = req.file.path;
-  const original = sanitizeName(req.file.originalname || `upload-${Date.now()}.jpg`);
-  const s3Key = `${Date.now()}-${original}`;
+  const original = sanitizeName(req.file.originalname || `photo-${Date.now()}.jpg`);
+  const s3Key = `${prefix}${Date.now()}-${original}`;
 
   try {
     const buffer = fs.readFileSync(tempPath);
@@ -64,8 +75,7 @@ app.post('/upload', upload.single('image'), async (req, res) => {
       DetectionAttributes: [],
     }).promise();
 
-    const imageUrl = s3.getSignedUrl('getObject', { Bucket: BUCKET, Key: s3Key, Expires: 600 });
-    res.json({ success: true, s3Key, indexedFaces: idx.FaceRecords?.length || 0, imageUrl });
+    res.json({ success: true, s3Key, indexedFaces: idx.FaceRecords?.length || 0 });
   } catch (err) {
     console.error('Upload/index error:', err);
     res.status(500).json({ success: false, error: 'Upload/index failed: ' + err.message });
@@ -74,9 +84,11 @@ app.post('/upload', upload.single('image'), async (req, res) => {
   }
 });
 
-// Match (single top result)
+// ------- Match (top 1) with optional ?event= filter -------
 app.post('/match', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ matchFound: false, error: 'No file uploaded. Field must be "image".' });
+  const event = (req.query.event || '').trim();
+  const wantedPrefix = event ? eventPrefix(event) : null;
   const tempPath = req.file.path;
 
   try {
@@ -85,14 +97,21 @@ app.post('/match', upload.single('image'), async (req, res) => {
       CollectionId: COLLECTION_ID,
       Image: { Bytes: buffer },
       FaceMatchThreshold: 85,
-      MaxFaces: 1,
+      MaxFaces: 5,
     }).promise();
 
-    if (result.FaceMatches && result.FaceMatches.length > 0) {
-      const top = result.FaceMatches[0];
+    const matches = (result.FaceMatches || []);
+    const filtered = wantedPrefix
+      ? matches.filter(m => (m.Face?.ExternalImageId || '').startsWith(wantedPrefix))
+      : matches;
+
+    if (filtered.length > 0) {
+      const top = filtered.sort((a,b) => (b.Similarity||0)-(a.Similarity||0))[0];
       const key = top.Face?.ExternalImageId;
       const similarity = top.Similarity;
-      const imageUrl = s3.getSignedUrl('getObject', { Bucket: BUCKET, Key: key, Expires: 600 });
+
+      // Proxy URL so links don't expire for users
+      const imageUrl = `/proxy-image?key=${encodeURIComponent(key)}`;
       return res.json({ matchFound: true, imageUrl, similarity, externalImageId: key });
     }
     return res.json({ matchFound: false });
@@ -104,9 +123,11 @@ app.post('/match', upload.single('image'), async (req, res) => {
   }
 });
 
-// NEW: Match Gallery (return multiple matches)
+// ------- Match Gallery (many) with optional ?event= filter -------
 app.post('/match-gallery', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ matchFound: false, error: 'No file uploaded. Field must be "image".' });
+  const event = (req.query.event || '').trim();
+  const wantedPrefix = event ? eventPrefix(event) : null;
   const tempPath = req.file.path;
 
   try {
@@ -114,24 +135,20 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
     const result = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION_ID,
       Image: { Bytes: buffer },
-      FaceMatchThreshold: 80, // a bit looser for gallery
-      MaxFaces: 12,          // return up to 12 matches
+      FaceMatchThreshold: 80,
+      MaxFaces: 12,
     }).promise();
 
-    if (!result.FaceMatches || result.FaceMatches.length === 0) {
-      return res.json({ matchFound: false, results: [] });
-    }
+    const matches = (result.FaceMatches || []);
+    const filtered = wantedPrefix
+      ? matches.filter(m => (m.Face?.ExternalImageId || '').startsWith(wantedPrefix))
+      : matches;
 
-    // Create signed URLs for each matched ExternalImageId
-    const results = result.FaceMatches
-      .sort((a, b) => (b.Similarity || 0) - (a.Similarity || 0))
-      .map(m => {
-        const key = m.Face?.ExternalImageId;
-        const similarity = m.Similarity;
-        const imageUrl = key ? s3.getSignedUrl('getObject', { Bucket: BUCKET, Key: key, Expires: 600 }) : null;
-        return { key, similarity, imageUrl };
-      })
-      .filter(r => !!r.imageUrl);
+    const results = filtered
+      .sort((a,b) => (b.Similarity||0)-(a.Similarity||0))
+      .map(m => ({ key: m.Face?.ExternalImageId, similarity: m.Similarity }))
+      .filter(r => !!r.key)
+      .map(r => ({ ...r, imageUrl: `/proxy-image?key=${encodeURIComponent(r.key)}` }));
 
     return res.json({ matchFound: results.length > 0, count: results.length, results });
   } catch (err) {
@@ -142,13 +159,11 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
   }
 });
 
-// Match by URL (kept for completeness)
+// ------- Match by URL (kept) -------
 app.post('/match-by-url', async (req, res) => {
   try {
-    const { url } = req.body || {};
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ matchFound: false, error: 'Missing or invalid url' });
-    }
+    const { url, event } = req.body || {};
+    if (!url || typeof url !== 'string') return res.status(400).json({ matchFound: false, error: 'Missing or invalid url' });
 
     const r = await fetch(url);
     if (!r.ok) return res.status(400).json({ matchFound: false, error: 'Could not fetch url' });
@@ -156,24 +171,51 @@ app.post('/match-by-url', async (req, res) => {
     const arrayBuf = await r.arrayBuffer();
     const buffer = Buffer.from(arrayBuf);
 
+    const wantedPrefix = event ? eventPrefix(event) : null;
+
     const result = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION_ID,
       Image: { Bytes: buffer },
       FaceMatchThreshold: 85,
-      MaxFaces: 1,
+      MaxFaces: 5,
     }).promise();
 
-    if (result.FaceMatches && result.FaceMatches.length > 0) {
-      const top = result.FaceMatches[0];
+    const matches = (result.FaceMatches || []);
+    const filtered = wantedPrefix
+      ? matches.filter(m => (m.Face?.ExternalImageId || '').startsWith(wantedPrefix))
+      : matches;
+
+    if (filtered.length > 0) {
+      const top = filtered.sort((a,b) => (b.Similarity||0)-(a.Similarity||0))[0];
       const key = top.Face?.ExternalImageId;
       const similarity = top.Similarity;
-      const imageUrl = s3.getSignedUrl('getObject', { Bucket: BUCKET, Key: key, Expires: 600 });
+      const imageUrl = `/proxy-image?key=${encodeURIComponent(key)}`;
       return res.json({ matchFound: true, imageUrl, similarity, externalImageId: key });
     }
     return res.json({ matchFound: false });
   } catch (err) {
     console.error('match-by-url failed:', err);
     res.status(500).json({ matchFound: false, error: 'match-by-url failed: ' + err.message });
+  }
+});
+
+// ------- Proxy image by S3 key (no expiry on client) -------
+app.get('/proxy-image', async (req, res) => {
+  try {
+    const key = req.query.key;
+    if (!key) return res.status(400).send('Missing key');
+
+    // Stream from S3
+    const s3Stream = s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream();
+    s3Stream.on('error', (e) => {
+      console.error('proxy-image S3 error:', e);
+      res.status(404).send('Not found');
+    });
+    res.setHeader('Content-Type', 'image/jpeg');
+    s3Stream.pipe(res);
+  } catch (err) {
+    console.error('proxy-image failed:', err);
+    res.status(500).send('proxy-image failed');
   }
 });
 
