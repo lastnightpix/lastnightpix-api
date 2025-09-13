@@ -6,7 +6,7 @@ const multer = require('multer');
 const fs = require('fs');
 const AWS = require('aws-sdk');
 const fetch = require('node-fetch');
-const Jimp = require('jimp');
+const sharp = require('sharp');
 
 // --- Stripe: lazy init so app boots even if STRIPE_SECRET is not set ---
 let _stripe = null;
@@ -146,35 +146,67 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
   } finally { safeUnlink(tempPath); }
 });
 
-/* ---------- Watermarked preview ---------- */
+/* ---------- Watermarked preview (sharp + SVG overlay) ---------- */
 app.get('/preview-image', async (req, res) => {
   try {
     const key = req.query.key;
+    const raw = req.query.raw;
     if (!key) return res.status(400).send('Missing key');
 
+    // Raw bypass for debugging
+    if (raw) {
+      const s3Stream = s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream();
+      s3Stream.on('error', e => { console.error('preview raw S3 error:', e); if (!res.headersSent) res.status(404).send('Not found'); });
+      res.setHeader('Content-Type', 'image/jpeg');
+      return s3Stream.pipe(res);
+    }
+
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
-    const img = await Jimp.read(obj.Body);
+    const img = sharp(obj.Body, { failOnError: false }); // be tolerant
+    const meta = await img.metadata();
+    const W = meta.width || 1200;
+    const H = meta.height || 800;
 
-    const W = img.bitmap.width, H = img.bitmap.height;
-    const margin = Math.floor(Math.min(W, H) * 0.03);
-    const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+    // Compute overlay box and font size relative to image width
+    const margin = Math.round(Math.min(W, H) * 0.03);
+    const fontSize = Math.max(18, Math.round(W * 0.035)); // 3.5% of width
     const text = 'LASTNIGHTPIX • PREVIEW';
-    const tw = Jimp.measureText(font, text);
-    const th = Jimp.measureTextHeight(font, text, W);
 
-    const boxW = tw + margin*2, boxH = th + margin*1.2;
-    const x = W - boxW - margin, y = H - boxH - margin;
+    // Build SVG overlay (black translucent box + white text)
+    // Use textLength to auto-fit; add padding via x/y.
+    const svg = `
+      <svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <filter id="bg" x="0" y="0" width="1" height="1">
+            <feFlood flood-color="black" flood-opacity="0.5"/>
+            <feComposite in="SourceGraphic"/>
+          </filter>
+        </defs>
+        <g>
+          <rect id="wm-bg" rx="${Math.round(margin*0.6)}" ry="${Math.round(margin*0.6)}"
+                x="${W - (W*0.5) + margin}" y="${H - (fontSize*2) - margin}"
+                width="${(W*0.5) - (margin*2)}" height="${fontSize*2}"
+                fill="black" fill-opacity="0.5"/>
+          <text x="${W - (W*0.5) + margin*1.5}" y="${H - margin - fontSize*0.5}"
+                font-family="Arial, Helvetica, sans-serif"
+                font-size="${fontSize}" fill="white">
+            ${text}
+          </text>
+        </g>
+      </svg>`;
 
-    const overlay = new Jimp(boxW, boxH, 0x00000080);
-    img.composite(overlay, x, y);
-    img.print(font, x + margin*0.8, y + (boxH - th)/2, text);
+    const overlay = Buffer.from(svg);
 
-    const out = await img.quality(80).getBufferAsync(Jimp.MIME_JPEG);
+    const out = await img
+      .jpeg({ quality: 80 })
+      .composite([{ input: overlay, gravity: 'southeast' }]) // bottom-right
+      .toBuffer();
+
     res.setHeader('Content-Type', 'image/jpeg');
     res.send(out);
   } catch (err) {
     console.error('preview-image failed:', err);
-    res.status(500).send('preview-image failed');
+    res.status(500).send('preview-image failed: ' + (err && err.message ? err.message : String(err)));
   }
 });
 
