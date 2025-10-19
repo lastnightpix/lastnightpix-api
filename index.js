@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const mime = require('mime-types');
 const fs = require('fs');
 const AWS = require('aws-sdk');
 const fetch = require('node-fetch');
