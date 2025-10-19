@@ -365,6 +365,11 @@ app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 // ------------- Admin bulk upload + Rekognition indexing -------------
 app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
   try {
+    console.log('ADMIN UPLOAD HIT', {
+  time: new Date().toISOString(),
+  filesCount: req.files ? req.files.length : 0,
+  contentType: req.headers['content-type']
+});
     // simple bearer token check
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
