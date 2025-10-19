@@ -170,7 +170,7 @@ app.get('/preview-image', async (req, res) => {
     // Compute overlay box and font size relative to image width
     const margin = Math.round(Math.min(W, H) * 0.03);
     const fontSize = Math.max(18, Math.round(W * 0.035)); // 3.5% of width
-    const text = 'LASTNIGHTPIX • PREVIEW';
+    const text = 'LastNightPix.com • PREVIEW';
 
     // Build SVG overlay (black translucent box + white text)
     // Use textLength to auto-fit; add padding via x/y.
