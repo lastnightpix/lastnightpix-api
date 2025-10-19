@@ -226,26 +226,66 @@ app.get('/proxy-image', async (req, res) => {
   }
 });
 
-/* ---------- Stripe: checkout + download ---------- */
+/* ---------- Stripe: checkout with per-photo bundle pricing ---------- */
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const stripe = getStripe();
-    const { key, priceCents } = req.body || {};
-    if (!key) return res.status(400).json({ error: 'Missing key' });
+    const { tier, key, keys, priceCents } = req.body || {};
 
-    const amount = Number.isFinite(priceCents) ? priceCents : 500;
+    // Pricing config
+    const SINGLE_PRICE = 199; // $1.99 for single photo
+    const MAX_ALBUM = 50;     // safety cap
+
+    let amount = 0;
+    let description = '';
+    let metadata = {};
+
+    if (tier === 'album') {
+      // Validate keys array
+      if (!Array.isArray(keys) || keys.length === 0) {
+        return res.status(400).json({ error: 'Missing keys for album purchase' });
+      }
+      const capped = keys.slice(0, MAX_ALBUM);
+      const count = capped.length;
+
+      // Auto pricing by count
+      // 1–3: $1.99 ea; 4–10: $1.50 ea; 11+: $1.00 ea
+      let per = 199;
+      if (count >= 4 && count <= 10) per = 150;
+      if (count >= 11) per = 100;
+
+      // Allow explicit override via priceCents if sent
+      amount = Number.isFinite(priceCents) ? priceCents : (per * count);
+
+      description = `${count} photos @ $${(per/100).toFixed(2)} each (ZIP)`;
+      metadata = { tier: 'album', keys: JSON.stringify(capped) };
+
+    } else {
+      // default single
+      if (!key) return res.status(400).json({ error: 'Missing key for single purchase' });
+
+      // Allow explicit override via priceCents, else $1.99
+      amount = Number.isFinite(priceCents) ? priceCents : SINGLE_PRICE;
+
+      description = key.split('/').pop() || 'HD Photo';
+      metadata = { tier: 'single', s3_key: key };
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       payment_method_types: ['card'],
       line_items: [{
         price_data: {
           currency: 'usd',
-          product_data: { name: 'HD Photo Download', description: key.split('/').pop() },
+          product_data: {
+            name: (tier === 'album') ? 'Full Set Download' : 'HD Photo Download',
+            description
+          },
           unit_amount: amount,
         },
         quantity: 1,
       }],
-      metadata: { s3_key: key },
+      metadata,
       success_url: `${FRONTEND_BASE}/thanks.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_BASE}/find-gallery.html`,
     });
@@ -256,6 +296,7 @@ app.post('/create-checkout-session', async (req, res) => {
     res.status(500).json({ error: 'Failed to create checkout session: ' + err.message });
   }
 });
+
 
 app.get('/download', async (req, res) => {
   try {
