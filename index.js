@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const mime = require('mime-types');
+const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } });
 const fs = require('fs');
 const AWS = require('aws-sdk');
 const fetch = require('node-fetch');
@@ -331,3 +332,63 @@ app.get('/download', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// ------------- Admin bulk upload + Rekognition indexing -------------
+app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
+  try {
+    // simple bearer token check
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (!token || token !== (process.env.ADMIN_TOKEN || '')) {
+      return res.status(401).json({ success:false, error:'Unauthorized' });
+    }
+
+    // event code optional; if blank, use "general"
+    const eventCode = (req.query.event || 'general').replace(/[^a-zA-Z0-9_\-:.]/g, '');
+    if (!req.files || !req.files.length) {
+      return res.status(400).json({ success:false, error:'No files uploaded' });
+    }
+
+    const results = [];
+    for (const f of req.files) {
+      try {
+        const ext = mime.extension(f.mimetype) || 'jpg';
+        const safeName = (f.originalname || `photo.${ext}`).replace(/[^\w.\-]/g, '_');
+        const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
+
+        // 1) Upload to S3
+        await s3.putObject({
+          Bucket: BUCKET,
+          Key: key,
+          Body: f.buffer,
+          ContentType: f.mimetype || 'image/jpeg',
+          ACL: 'private'
+        }).promise();
+
+        // 2) Index faces in Rekognition (OK if none found)
+        try {
+          await rekognition.indexFaces({
+            CollectionId: COLLECTION,
+            ExternalImageId: key, // use S3 key as external id
+            Image: { S3Object: { Bucket: BUCKET, Name: key } },
+            DetectionAttributes: [],
+            MaxFaces: 15,
+            QualityFilter: 'AUTO'
+          }).promise();
+        } catch (e) {
+          console.warn('indexFaces warn:', key, e?.message);
+        }
+
+        results.push({ key, ok:true });
+      } catch (e) {
+        console.error('admin upload item failed:', e);
+        results.push({ key: null, ok:false, error: e.message });
+      }
+    }
+
+    res.json({ success:true, event: eventCode, uploaded: results.length, results });
+  } catch (err) {
+    console.error('admin upload failed:', err);
+    res.status(500).json({ success:false, error:'admin upload failed: ' + err.message });
+  }
+});
+
