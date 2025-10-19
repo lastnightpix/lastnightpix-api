@@ -39,6 +39,16 @@ app.use(cors({
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
+// --- quick health/version check
+app.get('/version', (req, res) => {
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    hasAdminUpload: typeof app._router.stack.find(r => r.route && r.route.path === '/admin/upload') !== 'undefined'
+  });
+});
+
+// --- start-of-request log for admin upload (top of the handler)
 
 // Handle preflight for all routes (esp. /admin/upload)
 app.options('*', cors());
