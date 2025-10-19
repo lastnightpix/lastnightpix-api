@@ -24,8 +24,28 @@ function getStripe() {
 }
 
 const app = express();
+// CORS: allow your Netlify site to call this API
+const ALLOWED_ORIGINS = [
+  'https://lastnightpix.netlify.app',
+  'https://lastnightpix.netlify.app/' // safe duplicate
+];
+
+app.use(cors({
+  origin: function (origin, cb) {
+    // allow same-origin (no origin), and your Netlify site
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+
+// Handle preflight for all routes (esp. /admin/upload)
+app.options('*', cors());
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 const REGION = process.env.AWS_REGION || 'us-east-2';
 const BUCKET = process.env.BUCKET_NAME;
