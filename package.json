@@ -17,6 +17,7 @@
     "express": "^5.1.0",
     "jimp": "^1.6.0",
     "multer": "^2.0.2",
+    "mime-types": "^2.1.35",
     "node-fetch": "^3.3.2",
     "sharp": "^0.34.3",
     "stripe": "^18.5.0"
