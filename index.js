@@ -146,67 +146,74 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
   } finally { safeUnlink(tempPath); }
 });
 
-/* ---------- Watermarked preview (sharp + SVG overlay) ---------- */
+// ------- Watermarked Preview (tiled diagonal text) -------
 app.get('/preview-image', async (req, res) => {
   try {
     const key = req.query.key;
-    const raw = req.query.raw;
     if (!key) return res.status(400).send('Missing key');
 
-    // Raw bypass for debugging
-    if (raw) {
-      const s3Stream = s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream();
-      s3Stream.on('error', e => { console.error('preview raw S3 error:', e); if (!res.headersSent) res.status(404).send('Not found'); });
-      res.setHeader('Content-Type', 'image/jpeg');
-      return s3Stream.pipe(res);
-    }
+    // Read config from env or fallback
+    const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
+    const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18'); // 0..1
+    const WM_ANGLE = Number(process.env.WATERMARK_ANGLE || '-30');      // deg
+    const MAX_W = Number(process.env.PREVIEW_MAX_W || '1200');          // pixel width for previews
+    const JPEG_QUALITY = Number(process.env.PREVIEW_JPEG_QUALITY || '80');
 
+    // Get the original from S3
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
-    const img = sharp(obj.Body, { failOnError: false }); // be tolerant
-    const meta = await img.metadata();
-    const W = meta.width || 1200;
-    const H = meta.height || 800;
+    const inputBuffer = obj.Body;
 
-    // Compute overlay box and font size relative to image width
-    const margin = Math.round(Math.min(W, H) * 0.03);
-    const fontSize = Math.max(18, Math.round(W * 0.035)); // 3.5% of width
-    const text = 'LastNightPix.com • PREVIEW';
+    // Probe dimensions
+    const sharp = require('sharp');
+    const meta = await sharp(inputBuffer).metadata();
 
-    // Build SVG overlay (black translucent box + white text)
-    // Use textLength to auto-fit; add padding via x/y.
+    // Scale down to MAX_W to keep previews light
+    const width = Math.min(meta.width || MAX_W, MAX_W);
+
+    // Build a full-frame SVG watermark, tiled & angled
+    // We’ll size the canvas to the output width, estimate height from aspect
+    const aspect = (meta.width && meta.height) ? meta.height / meta.width : 1.5;
+    const outW = width;
+    const outH = Math.round(outW * aspect);
+
+    // tile size scales with width
+    const tile = Math.round(outW / 4);     // each tile square
+    const fontSize = Math.round(tile / 4); // readable but not huge
+
+    // SVG with rotated group & repeated text
+    // Use 'fill-opacity' for alpha; sharp respects it
     const svg = `
-      <svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+      <svg xmlns="http://www.w3.org/2000/svg" width="${outW}" height="${outH}">
         <defs>
-          <filter id="bg" x="0" y="0" width="1" height="1">
-            <feFlood flood-color="black" flood-opacity="0.5"/>
-            <feComposite in="SourceGraphic"/>
-          </filter>
+          <pattern id="wm" width="${tile}" height="${tile}" patternUnits="userSpaceOnUse"
+                   patternTransform="rotate(${WM_ANGLE})">
+            <text x="${Math.round(tile*0.1)}" y="${Math.round(tile*0.6)}"
+                  font-family="Arial, Helvetica, sans-serif"
+                  font-size="${fontSize}"
+                  fill="#FFFFFF"
+                  fill-opacity="${WM_OPACITY}"
+                  font-weight="700"
+                  letter-spacing="1">${WM_TEXT}</text>
+          </pattern>
         </defs>
-        <g>
-          <rect id="wm-bg" rx="${Math.round(margin*0.6)}" ry="${Math.round(margin*0.6)}"
-                x="${W - (W*0.5) + margin}" y="${H - (fontSize*2) - margin}"
-                width="${(W*0.5) - (margin*2)}" height="${fontSize*2}"
-                fill="black" fill-opacity="0.5"/>
-          <text x="${W - (W*0.5) + margin*1.5}" y="${H - margin - fontSize*0.5}"
-                font-family="Arial, Helvetica, sans-serif"
-                font-size="${fontSize}" fill="white">
-            ${text}
-          </text>
-        </g>
+        <rect width="100%" height="100%" fill="url(#wm)"/>
       </svg>`;
 
-    const overlay = Buffer.from(svg);
+    const svgBuffer = Buffer.from(svg);
 
-    const out = await img
-      .jpeg({ quality: 80 })
-      .composite([{ input: overlay, gravity: 'southeast' }]) // bottom-right
+    // Composite the SVG over a resized JPEG
+    const out = await sharp(inputBuffer)
+      .resize({ width: outW })
+      .composite([{ input: svgBuffer, gravity: 'center' }])
+      .jpeg({ quality: JPEG_QUALITY, chromaSubsampling: '4:4:4' })
       .toBuffer();
 
     res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 min CDN cache
     res.send(out);
   } catch (err) {
     console.error('preview-image failed:', err);
-    res.status(500).send('preview-image failed: ' + (err && err.message ? err.message : String(err)));
+    res.status(500).send('preview-image failed: ' + err.message);
   }
 });
 
