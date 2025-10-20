@@ -1,219 +1,108 @@
-require('dotenv').config();
+// =================== LastNightPix API (Express) ===================
+// Minimal, production-ready server for MVP:
+// - CORS (Netlify + local)
+// - Watermarked preview images from S3
+// - Face match across all photos (Rekognition)
+// - Stripe Checkout (single + album)
+// - Admin bulk upload + indexing
+// ================================================================
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const aws = require('aws-sdk');
+const sharp = require('sharp');
 const multer = require('multer');
 const mime = require('mime-types');
-const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } });
-const fs = require('fs');
-const AWS = require('aws-sdk');
-const fetch = require('node-fetch');
-const sharp = require('sharp');
+const Stripe = require('stripe');
 
-// --- Stripe: lazy init so app boots even if STRIPE_SECRET is not set ---
-let _stripe = null;
-function getStripe() {
-  if (_stripe) return _stripe;
-  const secret = process.env.STRIPE_SECRET;
-  if (!secret) {
-    throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
-  }
-  const Stripe = require('stripe');
-  _stripe = new Stripe(secret, { apiVersion: '2024-06-20' });
-  return _stripe;
-}
+// ---------- ENV ----------
+const PORT = process.env.PORT || 10000;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
+const BUCKET = process.env.BUCKET;
+const COLLECTION = process.env.COLLECTION;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const STRIPE_SECRET = process.env.STRIPE_SECRET || '';
+const PRICE_SINGLE = Number(process.env.PRICE_SINGLE || '199'); // cents
+const ALBUM_MIN = Number(process.env.ALBUM_MIN || '5');
+const ALBUM_CENTS = Number(process.env.ALBUM_CENTS || '999');
 
+// Preview / watermark tuning
+const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
+const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18');
+const WM_ANGLE = Number(process.env.WATERMARK_ANGLE || '-30');
+const PREVIEW_MAX_W = Number(process.env.PREVIEW_MAX_W || '1200');
+const PREVIEW_JPEG_QUALITY = Number(process.env.PREVIEW_JPEG_QUALITY || '80');
+
+// ---------- AWS ----------
+aws.config.update({
+  region: AWS_REGION,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,         // provided by Render env
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY, // provided by Render env
+});
+
+const s3 = new aws.S3();
+const rekognition = new aws.Rekognition();
+
+// ---------- Stripe ----------
+const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
+
+// ---------- App ----------
 const app = express();
-// CORS: allow your Netlify site to call this API
-const ALLOWED_ORIGINS = [
+
+// CORS (Netlify + local dev)
+const ALLOWED_ORIGINS = new Set([
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:8888',
   'https://lastnightpix.netlify.app',
-  'https://lastnightpix.netlify.app/' // safe duplicate
-];
+  'https://lastnightpix.netlify.app/'
+]);
 
 app.use(cors({
-  origin: function (origin, cb) {
-    // allow same-origin (no origin), and your Netlify site
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(null, false);
   },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
-// --- quick health/version check
-app.get('/version', (req, res) => {
-  res.json({
-    ok: true,
-    ts: new Date().toISOString(),
-    hasAdminUpload: typeof app._router.stack.find(r => r.route && r.route.path === '/admin/upload') !== 'undefined'
-  });
-});
 
-// --- start-of-request log for admin upload (top of the handler)
+app.options('*', cors()); // preflight
 
-// Handle preflight for all routes (esp. /admin/upload)
-app.options('*', cors());
-
-app.use(cors());
+// Body parsing (for JSON routes)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const REGION = process.env.AWS_REGION || 'us-east-2';
-const BUCKET = process.env.BUCKET_NAME;
-const COLLECTION_ID = process.env.COLLECTION_ID;
-const FRONTEND_BASE = process.env.FRONTEND_BASE || 'https://YOUR-SITE.netlify.app';
+// Upload handling (for multipart file uploads)
+const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB/file
 
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: REGION,
+// ---------------- Health / Version ----------------
+app.get('/version', (req, res) => {
+  const hasAdminUpload = !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload'));
+  res.json({ ok: true, ts: new Date().toISOString(), hasAdminUpload });
 });
 
-const s3 = new AWS.S3();
-const rekognition = new AWS.Rekognition();
-
-const upload = multer({ dest: 'uploads/', limits: { fileSize: 10 * 1024 * 1024 } });
-function safeUnlink(p) { try { fs.unlinkSync(p); } catch (_) {} }
-
-function eventPrefix(event) { return event ? `event-photos/${event}/` : `event-photos/default/`; }
-function toExternalId(s3Key) { return String(s3Key).replace(/\//g, ':'); }
-function fromExternalId(extId) { return String(extId).replace(/:/g, '/'); }
-function colonPrefix(prefix) { return String(prefix).replace(/\//g, ':'); }
-
-app.get('/health', (_req, res) => res.send('ok'));
-
-/* ---------- Upload & index ---------- */
-app.post('/upload', upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded. Field must be "image".' });
-  const event = (req.query.event || '').trim();
-  const prefix = eventPrefix(event);
-
-  const tempPath = req.file.path;
-  const original = (req.file.originalname || `photo-${Date.now()}.jpg`).replace(/[^\w.\-:/]+/g, '_');
-  const s3Key = `${prefix}${Date.now()}-${original}`;
-
-  try {
-    const buffer = fs.readFileSync(tempPath);
-    await s3.putObject({ Bucket: BUCKET, Key: s3Key, Body: buffer, ContentType: req.file.mimetype || 'image/jpeg', ACL: 'private' }).promise();
-
-    const externalId = toExternalId(s3Key);
-    const idx = await rekognition.indexFaces({
-      CollectionId: COLLECTION_ID,
-      Image: { S3Object: { Bucket: BUCKET, Name: s3Key } },
-      ExternalImageId: externalId,
-      DetectionAttributes: [],
-    }).promise();
-
-    res.json({ success: true, s3Key, externalId, indexedFaces: idx.FaceRecords?.length || 0 });
-  } catch (err) {
-    console.error('Upload/index error:', err);
-    res.status(500).json({ success: false, error: 'Upload/index failed: ' + err.message });
-  } finally { safeUnlink(tempPath); }
-});
-
-/* ---------- Match (single) ---------- */
-app.post('/match', upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ matchFound: false, error: 'No file uploaded. Field must be "image".' });
-  const event = (req.query.event || '').trim();
-  const wantedColonPrefix = event ? colonPrefix(eventPrefix(event)) : null;
-  const tempPath = req.file.path;
-
-  try {
-    const buffer = fs.readFileSync(tempPath);
-    const result = await rekognition.searchFacesByImage({
-      CollectionId: COLLECTION_ID,
-      Image: { Bytes: buffer },
-      FaceMatchThreshold: 85,
-      MaxFaces: 5,
-    }).promise();
-
-    let matches = (result.FaceMatches || []);
-    if (wantedColonPrefix) matches = matches.filter(m => (m.Face?.ExternalImageId || '').startsWith(wantedColonPrefix));
-
-    if (matches.length > 0) {
-      const top = matches.sort((a,b)=> (b.Similarity||0)-(a.Similarity||0))[0];
-      const s3Key = fromExternalId(top.Face?.ExternalImageId || '');
-      return res.json({
-        matchFound: true,
-        imageUrl: `/preview-image?key=${encodeURIComponent(s3Key)}`,
-        fullImageUrl: `/proxy-image?key=${encodeURIComponent(s3Key)}`,
-        similarity: top.Similarity,
-        s3Key
-      });
-    }
-    res.json({ matchFound: false });
-  } catch (err) {
-    console.error('Matching failed:', err);
-    res.status(500).send('Matching failed: ' + err.message);
-  } finally { safeUnlink(tempPath); }
-});
-
-/* ---------- Match gallery (many) ---------- */
-app.post('/match-gallery', upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ matchFound: false, error: 'No file uploaded. Field must be "image".' });
-  const event = (req.query.event || '').trim();
-  const wantedColonPrefix = event ? colonPrefix(eventPrefix(event)) : null;
-  const tempPath = req.file.path;
-
-  try {
-    const buffer = fs.readFileSync(tempPath);
-    const result = await rekognition.searchFacesByImage({
-      CollectionId: COLLECTION_ID,
-      Image: { Bytes: buffer },
-      FaceMatchThreshold: 80,
-      MaxFaces: 12,
-    }).promise();
-
-    let matches = (result.FaceMatches || []);
-    if (wantedColonPrefix) matches = matches.filter(m => (m.Face?.ExternalImageId || '').startsWith(wantedColonPrefix));
-
-    const results = matches.sort((a,b)=> (b.Similarity||0)-(a.Similarity||0)).map(m => {
-      const s3Key = fromExternalId(m.Face?.ExternalImageId || '');
-      return { key: s3Key, similarity: m.Similarity, imageUrl: `/preview-image?key=${encodeURIComponent(s3Key)}` };
-    });
-
-    res.json({ matchFound: results.length > 0, count: results.length, results });
-  } catch (err) {
-    console.error('match-gallery failed:', err);
-    res.status(500).json({ matchFound: false, error: 'match-gallery failed: ' + err.message, results: [] });
-  } finally { safeUnlink(tempPath); }
-});
-
-// ------- Watermarked Preview (tiled diagonal text) -------
+// ---------------- Watermarked Preview ----------------
+// GET /preview-image?key=<S3 key>
 app.get('/preview-image', async (req, res) => {
   try {
     const key = req.query.key;
     if (!key) return res.status(400).send('Missing key');
 
-    // Read config from env or fallback
-    const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
-    const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18'); // 0..1
-    const WM_ANGLE = Number(process.env.WATERMARK_ANGLE || '-30');      // deg
-    const MAX_W = Number(process.env.PREVIEW_MAX_W || '1200');          // pixel width for previews
-    const JPEG_QUALITY = Number(process.env.PREVIEW_JPEG_QUALITY || '80');
-
-    // Get the original from S3
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
     const inputBuffer = obj.Body;
 
-    // Probe dimensions
-    const sharp = require('sharp');
     const meta = await sharp(inputBuffer).metadata();
-
-    // Scale down to MAX_W to keep previews light
-    const width = Math.min(meta.width || MAX_W, MAX_W);
-
-    // Build a full-frame SVG watermark, tiled & angled
-    // We’ll size the canvas to the output width, estimate height from aspect
+    const width = Math.min(meta.width || PREVIEW_MAX_W, PREVIEW_MAX_W);
     const aspect = (meta.width && meta.height) ? meta.height / meta.width : 1.5;
     const outW = width;
     const outH = Math.round(outW * aspect);
 
-    // tile size scales with width
-    const tile = Math.round(outW / 4);     // each tile square
-    const fontSize = Math.round(tile / 4); // readable but not huge
+    const tile = Math.round(outW / 4);
+    const fontSize = Math.round(tile / 4);
 
-    // SVG with rotated group & repeated text
-    // Use 'fill-opacity' for alpha; sharp respects it
     const svg = `
       <svg xmlns="http://www.w3.org/2000/svg" width="${outW}" height="${outH}">
         <defs>
@@ -233,15 +122,14 @@ app.get('/preview-image', async (req, res) => {
 
     const svgBuffer = Buffer.from(svg);
 
-    // Composite the SVG over a resized JPEG
     const out = await sharp(inputBuffer)
       .resize({ width: outW })
       .composite([{ input: svgBuffer, gravity: 'center' }])
-      .jpeg({ quality: JPEG_QUALITY, chromaSubsampling: '4:4:4' })
+      .jpeg({ quality: PREVIEW_JPEG_QUALITY, chromaSubsampling: '4:4:4' })
       .toBuffer();
 
     res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 min CDN cache
+    res.setHeader('Cache-Control', 'public, max-age=300');
     res.send(out);
   } catch (err) {
     console.error('preview-image failed:', err);
@@ -249,138 +137,149 @@ app.get('/preview-image', async (req, res) => {
   }
 });
 
-/* ---------- Original (no watermark) ---------- */
-app.get('/proxy-image', async (req, res) => {
+// ---------------- Face Match (Gallery) ----------------
+// POST /match-gallery   (multipart/form-data; field "image")
+// Returns: { matchFound, results: [{key, similarity, imageUrl}] }
+app.post('/match-gallery', upload.single('image'), async (req, res) => {
   try {
-    const key = req.query.key;
-    if (!key) return res.status(400).send('Missing key');
-    const s3Stream = s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream();
-    s3Stream.on('error', e => { console.error('proxy-image S3 error:', e); if (!res.headersSent) res.status(404).send('Not found'); });
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'private, max-age=300');
-    s3Stream.pipe(res);
+    if (!req.file || !req.file.buffer) {
+      return res.json({ matchFound: false, error: 'No image uploaded' });
+    }
+
+    // Search faces by image against your collection
+    const search = await rekognition.searchFacesByImage({
+      CollectionId: COLLECTION,
+      FaceMatchThreshold: 85, // adjust if needed
+      MaxFaces: 50,
+      Image: { Bytes: req.file.buffer }
+    }).promise();
+
+    if (!search.FaceMatches || !search.FaceMatches.length) {
+      return res.json({ matchFound: false, results: [] });
+    }
+
+    // Each Face has an ExternalImageId we set to the S3 key when indexing
+    const results = [];
+    for (const m of search.FaceMatches) {
+      const face = m.Face || {};
+      const key = face.ExternalImageId || null;
+      if (!key) continue;
+      results.push({
+        key,
+        similarity: Math.round(m.Similarity || 0),
+        imageUrl: `/preview-image?key=${encodeURIComponent(key)}`
+      });
+    }
+
+    // Deduplicate by key, sort by similarity desc
+    const seen = new Set();
+    const unique = results.filter(r => (r.key && !seen.has(r.key) && seen.add(r.key)));
+    unique.sort((a,b) => (b.similarity - a.similarity));
+
+    res.json({ matchFound: unique.length > 0, results: unique });
   } catch (err) {
-    console.error('proxy-image failed:', err);
-    res.status(500).send('proxy-image failed');
+    console.error('match-gallery failed:', err);
+    res.status(500).json({ matchFound: false, error: err.message });
   }
 });
 
-/* ---------- Stripe: checkout with per-photo bundle pricing ---------- */
+// ---------------- Stripe Checkout ----------------
+// POST /create-checkout-session
+// Body: { tier: 'single', key } OR { tier: 'album', keys: [] }
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const stripe = getStripe();
-    const { tier, key, keys, priceCents } = req.body || {};
+    if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
 
-    // Pricing config
-    const SINGLE_PRICE = 199; // $1.99 for single photo
-    const MAX_ALBUM = 50;     // safety cap
+    const { tier, key, keys } = req.body || {};
+    if (tier === 'single') {
+      if (!key) return res.status(400).json({ error: 'Missing key' });
 
-    let amount = 0;
-    let description = '';
-    let metadata = {};
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [{
+          price_data: {
+            currency: 'usd',
+            product_data: { name: 'HD Photo (Single)' },
+            unit_amount: PRICE_SINGLE
+          },
+          quantity: 1
+        }],
+        success_url: `${FRONTEND_URL}/thanks.html?tier=single&key=${encodeURIComponent(key)}&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`
+      });
 
-    if (tier === 'album') {
-      // Validate keys array
-      if (!Array.isArray(keys) || keys.length === 0) {
-        return res.status(400).json({ error: 'Missing keys for album purchase' });
-      }
-      const capped = keys.slice(0, MAX_ALBUM);
-      const count = capped.length;
-
-      // Auto pricing by count
-      // 1–3: $1.99 ea; 4–10: $1.50 ea; 11+: $1.00 ea
-      let per = 199;
-      if (count >= 4 && count <= 10) per = 150;
-      if (count >= 11) per = 100;
-
-      // Allow explicit override via priceCents if sent
-      amount = Number.isFinite(priceCents) ? priceCents : (per * count);
-
-      description = `${count} photos @ $${(per/100).toFixed(2)} each (ZIP)`;
-      metadata = { tier: 'album', keys: JSON.stringify(capped) };
-
-    } else {
-      // default single
-      if (!key) return res.status(400).json({ error: 'Missing key for single purchase' });
-
-      // Allow explicit override via priceCents, else $1.99
-      amount = Number.isFinite(priceCents) ? priceCents : SINGLE_PRICE;
-
-      description = key.split('/').pop() || 'HD Photo';
-      metadata = { tier: 'single', s3_key: key };
+      return res.json({ url: session.url });
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: (tier === 'album') ? 'Full Set Download' : 'HD Photo Download',
-            description
-          },
-          unit_amount: amount,
-        },
-        quantity: 1,
-      }],
-      metadata,
-      success_url: `${FRONTEND_BASE}/thanks.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_BASE}/find-gallery.html`,
-    });
+    if (tier === 'album') {
+      const arr = Array.isArray(keys) ? keys.filter(Boolean) : [];
+      if (!arr.length) return res.status(400).json({ error: 'Missing keys' });
 
-    res.json({ url: session.url });
+      // Simple album pricing: flat ALBUM_CENTS if >= ALBUM_MIN; otherwise sum singles
+      const priceCents = (arr.length >= ALBUM_MIN) ? ALBUM_CENTS : (arr.length * PRICE_SINGLE);
+
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [{
+          price_data: {
+            currency: 'usd',
+            product_data: { name: `HD Album (${arr.length} photos)` },
+            unit_amount: priceCents
+          },
+          quantity: 1
+        }],
+        success_url: `${FRONTEND_URL}/thanks.html?tier=album&count=${arr.length}&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
+        metadata: { keys: JSON.stringify(arr.slice(0, 100)) } // limited for safety
+      });
+
+      return res.json({ url: session.url });
+    }
+
+    return res.status(400).json({ error: 'Invalid tier' });
   } catch (err) {
     console.error('create-checkout-session failed:', err);
     res.status(500).json({ error: 'Failed to create checkout session: ' + err.message });
   }
 });
 
-
+// ---------------- Secure Download ----------------
+// GET /download?key=<S3 key>
+// Returns a short-lived signed URL to the original (no watermark).
 app.get('/download', async (req, res) => {
   try {
-    const stripe = getStripe();
-    const sessionId = req.query.session_id;
-    if (!sessionId) return res.status(400).send('Missing session_id');
+    const key = req.query.key;
+    if (!key) return res.status(400).json({ error: 'Missing key' });
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-    if (!session || session.payment_status !== 'paid') return res.status(402).send('Payment required or not verified');
+    const url = s3.getSignedUrl('getObject', {
+      Bucket: BUCKET,
+      Key: key,
+      Expires: 60 // seconds
+    });
 
-    const key = session.metadata && session.metadata.s3_key;
-    if (!key) return res.status(400).send('Missing key in session metadata');
-
-    const s3Stream = s3.getObject({ Bucket: BUCKET, Key: key }).createReadStream();
-    s3Stream.on('error', e => { console.error('download S3 error:', e); if (!res.headersSent) res.status(404).send('Not found'); });
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${key.split('/').pop()}"`);
-    s3Stream.pipe(res);
+    res.json({ url });
   } catch (err) {
     console.error('download failed:', err);
-    res.status(500).send('download failed: ' + err.message);
+    res.status(500).json({ error: 'download failed: ' + err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-// ------------- Admin bulk upload + Rekognition indexing -------------
+// ---------------- Admin Bulk Upload + Index ----------------
+// POST /admin/upload?event=<optional>
+// Header: Authorization: Bearer <ADMIN_TOKEN>
+// Form field: photos (multiple)
 app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
   try {
-    console.log('ADMIN UPLOAD HIT', {
-  time: new Date().toISOString(),
-  filesCount: req.files ? req.files.length : 0,
-  contentType: req.headers['content-type']
-});
-    // simple bearer token check
+    // auth
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (!token || token !== (process.env.ADMIN_TOKEN || '')) {
-      return res.status(401).json({ success:false, error:'Unauthorized' });
+    if (!token || token !== ADMIN_TOKEN) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
 
-    // event code optional; if blank, use "general"
     const eventCode = (req.query.event || 'general').replace(/[^a-zA-Z0-9_\-:.]/g, '');
     if (!req.files || !req.files.length) {
-      return res.status(400).json({ success:false, error:'No files uploaded' });
+      return res.status(400).json({ success: false, error: 'No files uploaded' });
     }
 
     const results = [];
@@ -390,7 +289,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
         const safeName = (f.originalname || `photo.${ext}`).replace(/[^\w.\-]/g, '_');
         const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
 
-        // 1) Upload to S3
+        // 1) upload to S3 (private)
         await s3.putObject({
           Bucket: BUCKET,
           Key: key,
@@ -399,11 +298,11 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           ACL: 'private'
         }).promise();
 
-        // 2) Index faces in Rekognition (OK if none found)
+        // 2) index faces (ignore if none)
         try {
           await rekognition.indexFaces({
             CollectionId: COLLECTION,
-            ExternalImageId: key, // use S3 key as external id
+            ExternalImageId: key,
             Image: { S3Object: { Bucket: BUCKET, Name: key } },
             DetectionAttributes: [],
             MaxFaces: 15,
@@ -413,17 +312,22 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           console.warn('indexFaces warn:', key, e?.message);
         }
 
-        results.push({ key, ok:true });
+        results.push({ key, ok: true });
       } catch (e) {
         console.error('admin upload item failed:', e);
-        results.push({ key: null, ok:false, error: e.message });
+        results.push({ key: null, ok: false, error: e.message });
       }
     }
 
-    res.json({ success:true, event: eventCode, uploaded: results.length, results });
+    res.json({ success: true, event: eventCode, uploaded: results.length, results });
   } catch (err) {
     console.error('admin upload failed:', err);
-    res.status(500).json({ success:false, error:'admin upload failed: ' + err.message });
+    res.status(500).json({ success: false, error: 'admin upload failed: ' + err.message });
   }
 });
 
+// ---------------- Start server ----------------
+app.get('/', (req, res) => res.send('LastNightPix API is running'));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
