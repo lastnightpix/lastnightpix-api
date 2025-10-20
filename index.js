@@ -1,10 +1,9 @@
 // =================== LastNightPix API (Express) ===================
-// MVP server:
 // - CORS (Netlify + local)
 // - Watermarked previews from S3
 // - Rekognition face match (selfie -> gallery) with HEIC handling
 // - Stripe checkout (single + album)
-// - Admin bulk upload: normalize to JPEG, resize, index; debug if 0 faces
+// - Admin upload: normalize JPEG, resize, brighten, index; return unindexedReasons
 // ================================================================
 
 require('dotenv').config();
@@ -161,9 +160,9 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
 
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 80,     // forgiving for nightlife
+      FaceMatchThreshold: 75,     // lowered for testing/nightlife
       MaxFaces: 50,
-      QualityFilter: 'NONE',      // do not discard
+      QualityFilter: 'NONE',
       Image: { Bytes: selfieBytes }
     }).promise();
 
@@ -183,7 +182,6 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       });
     }
 
-    // Dedup and sort
     const seen = new Set();
     const unique = results.filter(r => (r.key && !seen.has(r.key) && seen.add(r.key)));
     unique.sort((a,b) => (b.similarity - a.similarity));
@@ -196,7 +194,6 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
 });
 
 // ---------------- Stripe Checkout ----------------
-// POST /create-checkout-session  Body: { tier:'single', key } or { tier:'album', keys:[] }
 app.post('/create-checkout-session', async (req, res) => {
   try {
     if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
@@ -204,7 +201,6 @@ app.post('/create-checkout-session', async (req, res) => {
     const { tier, key, keys } = req.body || {};
     if (tier === 'single') {
       if (!key) return res.status(400).json({ error: 'Missing key' });
-
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         line_items: [{
@@ -218,16 +214,13 @@ app.post('/create-checkout-session', async (req, res) => {
         success_url: `${FRONTEND_URL}/thanks.html?tier=single&key=${encodeURIComponent(key)}&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`
       });
-
       return res.json({ url: session.url });
     }
 
     if (tier === 'album') {
       const arr = Array.isArray(keys) ? keys.filter(Boolean) : [];
       if (!arr.length) return res.status(400).json({ error: 'Missing keys' });
-
       const priceCents = (arr.length >= ALBUM_MIN) ? ALBUM_CENTS : (arr.length * PRICE_SINGLE);
-
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         line_items: [{
@@ -242,7 +235,6 @@ app.post('/create-checkout-session', async (req, res) => {
         cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
         metadata: { keys: JSON.stringify(arr.slice(0, 100)) }
       });
-
       return res.json({ url: session.url });
     }
 
@@ -254,7 +246,6 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // ---------------- Secure Download ----------------
-// GET /download?key=<S3 key>  -> returns short-lived signed URL
 app.get('/download', async (req, res) => {
   try {
     const key = req.query.key;
@@ -294,17 +285,17 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     const results = [];
     for (const f of req.files) {
       try {
-        // --------- Normalize to standard JPEG (auto-rotate, sRGB) ---------
+        // --------- Normalize to standard JPEG (auto-rotate, resize, brighten) ---------
         let baseName = (f.originalname || 'photo.jpg');
         const looksHeic = /image\/heic|image\/heif/i.test(f.mimetype || '') || /\.(heic|heif)$/i.test(baseName);
-
         if (looksHeic) baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
-        else baseName = baseName.replace(/\.(jpeg|jpg|png|gif|webp|tif|tiff)$/i, '.jpg'); // normalize extension
+        else baseName = baseName.replace(/\.(jpeg|jpg|png|gif|webp|tif|tiff)$/i, '.jpg');
 
-        let pipeline = sharp(f.buffer).rotate(); // auto-rotate via EXIF
-        pipeline = pipeline
-          .withMetadata({ orientation: 1 }) // strip orientation after rotate
+        let pipeline = sharp(f.buffer).rotate()
+          .withMetadata({ orientation: 1 })
           .resize({ width: 3000, height: 3000, fit: 'inside', withoutEnlargement: true })
+          .ensureAlpha()
+          .modulate({ brightness: 1.05, saturation: 1.05 })
           .toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
 
         const bodyBuffer = await pipeline.toBuffer();
@@ -323,8 +314,9 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           ACL: 'private'
         }).promise();
 
-        // 2) Index faces (OK if none)
+        // 2) Index faces (OK if none) + capture unindexed reasons
         let facesIndexed = 0;
+        let unindexedReasons = [];
         try {
           const idx = await rekognition.indexFaces({
             CollectionId: COLLECTION,
@@ -334,7 +326,14 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
             MaxFaces: 30,
             QualityFilter: 'NONE'
           }).promise();
+
           facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
+
+          if (Array.isArray(idx.UnindexedFaces) && idx.UnindexedFaces.length) {
+            unindexedReasons = idx.UnindexedFaces
+              .flatMap(u => Array.isArray(u.Reasons) ? u.Reasons : [])
+              .map(String);
+          }
         } catch (e) {
           console.warn('indexFaces warn:', key, e?.message);
         }
@@ -349,12 +348,12 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
             }).promise();
             faceCountInImage = Array.isArray(det.FaceDetails) ? det.FaceDetails.length : 0;
           } catch (e) {
-            faceCountInImage = -1; // means detect failed
+            faceCountInImage = -1;
             console.warn('detectFaces warn:', key, e?.message);
           }
         }
 
-        results.push({ key, ok: true, facesIndexed, faceCountInImage });
+        results.push({ key, ok: true, facesIndexed, faceCountInImage, unindexedReasons });
       } catch (e) {
         console.error('admin upload item failed:', e);
         results.push({ key: null, ok: false, error: e.message });
