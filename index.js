@@ -155,9 +155,10 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
     // Search faces by image against your collection
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 85, // adjust if needed
-      MaxFaces: 50,
-      Image: { Bytes: req.file.buffer }
+      FaceMatchThreshold: 80,
+MaxFaces: 50,
+QualityFilter: 'NONE',
+Image: { Bytes: req.file.buffer }
     }).promise();
 
     if (!search.FaceMatches || !search.FaceMatches.length) {
