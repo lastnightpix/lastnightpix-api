@@ -312,21 +312,45 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
 
     const results = [];
     for (const f of req.files) {
-      try {
-        const ext = mime.extension(f.mimetype) || 'jpg';
-        const safeName = (f.originalname || `photo.${ext}`).replace(/[^\w.\-]/g, '_');
-        const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
+      // inside: for (const f of req.files) { ... }
 
-        // 1) upload to S3 (private)
-        await s3.putObject({
-          Bucket: BUCKET,
-          Key: key,
-          Body: f.buffer,
-          ContentType: f.mimetype || 'image/jpeg',
-          ACL: 'private'
-        }).promise();
+let contentType = f.mimetype || 'image/jpeg';
+let ext = mime.extension(contentType) || 'jpg';
+let baseName = (f.originalname || `photo.${ext}`);
 
-        // 2) index faces (OK if none)
+// Detect HEIC/HEIF by mimetype OR filename and convert to JPEG
+const looksHeic = /image\/heic|image\/heif/i.test(contentType) || /\.(heic|heif)$/i.test(baseName);
+let bodyBuffer = f.buffer;
+
+if (looksHeic) {
+  try {
+    const jpg = await sharp(f.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer();
+    bodyBuffer = jpg;
+    contentType = 'image/jpeg';
+    ext = 'jpg';
+    baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
+    console.log('[admin/upload] converted HEIC→JPEG:', baseName);
+  } catch (e) {
+    console.warn('[admin/upload] HEIC convert failed, indexing may fail:', e.message);
+  }
+}
+
+// sanitize file name (after possible conversion)
+const safeName = baseName.replace(/[^\w.\-]/g, '_');
+
+// S3 key
+const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
+
+// 1) Upload to S3 (private)
+await s3.putObject({
+  Bucket: BUCKET,
+  Key: key,
+  Body: bodyBuffer,
+  ContentType: contentType,
+  ACL: 'private'
+}).promise();
+
+// 2) Index faces (OK if none)
 let facesIndexed = 0;
 try {
   const idx = await rekognition.indexFaces({
@@ -337,13 +361,11 @@ try {
     MaxFaces: 15,
     QualityFilter: 'NONE'
   }).promise();
-
   facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
 } catch (e) {
   console.warn('indexFaces warn:', key, e?.message);
 }
 
-// record result (always defined)
 results.push({ key, ok: true, facesIndexed });
       } catch (e) {
         console.error('admin upload item failed:', e);
