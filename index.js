@@ -1,10 +1,10 @@
 // =================== LastNightPix API (Express) ===================
-// Minimal, production-ready server for MVP:
+// MVP server:
 // - CORS (Netlify + local)
-// - Watermarked preview images from S3
-// - Face match across all photos (Rekognition)
-// - Stripe Checkout (single + album)
-// - Admin bulk upload + indexing
+// - Watermarked previews from S3
+// - Rekognition face match (selfie -> gallery)
+// - Stripe checkout (single + album)
+// - Admin bulk upload with HEIC->JPEG conversion + indexing
 // ================================================================
 
 require('dotenv').config();
@@ -12,7 +12,7 @@ const express = require('express');
 const cors = require('cors');
 const aws = require('aws-sdk');
 const sharp = require('sharp');
-const multer = require('multer');
+const multer = require('multer');            // v1.4.5-lts.1 recommended
 const mime = require('mime-types');
 const Stripe = require('stripe');
 
@@ -38,10 +38,9 @@ const PREVIEW_JPEG_QUALITY = Number(process.env.PREVIEW_JPEG_QUALITY || '80');
 // ---------- AWS ----------
 aws.config.update({
   region: AWS_REGION,
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,         // provided by Render env
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY, // provided by Render env
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
-
 const s3 = new aws.S3();
 const rekognition = new aws.Rekognition();
 
@@ -51,7 +50,7 @@ const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 // ---------- App ----------
 const app = express();
 
-// CORS (Netlify + local dev)
+// CORS allow Netlify + local
 const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
   'http://127.0.0.1:3000',
@@ -59,7 +58,6 @@ const ALLOWED_ORIGINS = new Set([
   'https://lastnightpix.netlify.app',
   'https://lastnightpix.netlify.app/'
 ]);
-
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
@@ -68,25 +66,24 @@ app.use(cors({
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
+app.options('*', cors());
 
-app.options('*', cors()); // preflight
-
-// Body parsing (for JSON routes)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Upload handling (for multipart file uploads)
+// Multer for multipart
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB/file
 
 // ---------------- Health / Version ----------------
-app.get('/version', async (req, res) => {
+app.get('/version', (req, res) => {
+  const hasAdminUpload = !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload'));
   res.json({
     ok: true,
     ts: new Date().toISOString(),
-    hasAdminUpload: !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload')),
+    hasAdminUpload,
     region: process.env.AWS_REGION,
-    bucket: process.env.BUCKET ? '(set)' : '(MISSING)',
-    collection: process.env.COLLECTION ? '(set)' : '(MISSING)'
+    bucket: BUCKET ? '(set)' : '(MISSING)',
+    collection: COLLECTION ? '(set)' : '(MISSING)'
   });
 });
 
@@ -125,7 +122,6 @@ app.get('/preview-image', async (req, res) => {
         </defs>
         <rect width="100%" height="100%" fill="url(#wm)"/>
       </svg>`;
-
     const svgBuffer = Buffer.from(svg);
 
     const out = await sharp(inputBuffer)
@@ -143,7 +139,7 @@ app.get('/preview-image', async (req, res) => {
   }
 });
 
-// ---------------- Face Match (Gallery) ----------------
+// ---------------- Face Match (selfie -> gallery) ----------------
 // POST /match-gallery   (multipart/form-data; field "image")
 // Returns: { matchFound, results: [{key, similarity, imageUrl}] }
 app.post('/match-gallery', upload.single('image'), async (req, res) => {
@@ -152,20 +148,25 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       return res.json({ matchFound: false, error: 'No image uploaded' });
     }
 
-    // Search faces by image against your collection
+    // HEIC/HEIF -> JPEG for selfie uploads
+    const ct = req.file.mimetype || 'image/jpeg';
+    const isHeic = /image\/heic|image\/heif/i.test(ct) || /\.(heic|heif)$/i.test(req.file.originalname || '');
+    const bytes = isHeic
+      ? await sharp(req.file.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer()
+      : req.file.buffer;
+
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 80,
-MaxFaces: 50,
-QualityFilter: 'NONE',
-Image: { Bytes: req.file.buffer }
+      FaceMatchThreshold: 80,     // lowered for nightlife conditions
+      MaxFaces: 50,
+      QualityFilter: 'NONE',      // don't discard in search
+      Image: { Bytes: bytes }
     }).promise();
 
     if (!search.FaceMatches || !search.FaceMatches.length) {
       return res.json({ matchFound: false, results: [] });
     }
 
-    // Each Face has an ExternalImageId we set to the S3 key when indexing
     const results = [];
     for (const m of search.FaceMatches) {
       const face = m.Face || {};
@@ -178,7 +179,7 @@ Image: { Bytes: req.file.buffer }
       });
     }
 
-    // Deduplicate by key, sort by similarity desc
+    // Dedup and sort
     const seen = new Set();
     const unique = results.filter(r => (r.key && !seen.has(r.key) && seen.add(r.key)));
     unique.sort((a,b) => (b.similarity - a.similarity));
@@ -189,31 +190,9 @@ Image: { Bytes: req.file.buffer }
     res.status(500).json({ matchFound: false, error: err.message });
   }
 });
-// Debug: POST /debug-search  (multipart form: field "image")
-app.post('/debug-search', upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'no image' });
-    const out = await rekognition.searchFacesByImage({
-      CollectionId: COLLECTION,
-      FaceMatchThreshold: 70,
-      MaxFaces: 10,
-      QualityFilter: 'NONE',
-      Image: { Bytes: req.file.buffer }
-    }).promise();
-    const list = (out.FaceMatches || []).map(m => ({
-      similarity: Math.round(m.Similarity || 0),
-      key: m.Face?.ExternalImageId || null,
-      faceId: m.Face?.FaceId || null
-    }));
-    res.json({ count: list.length, results: list });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ---------------- Stripe Checkout ----------------
-// POST /create-checkout-session
-// Body: { tier: 'single', key } OR { tier: 'album', keys: [] }
+// POST /create-checkout-session  Body: { tier:'single', key } or { tier:'album', keys:[] }
 app.post('/create-checkout-session', async (req, res) => {
   try {
     if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
@@ -243,7 +222,6 @@ app.post('/create-checkout-session', async (req, res) => {
       const arr = Array.isArray(keys) ? keys.filter(Boolean) : [];
       if (!arr.length) return res.status(400).json({ error: 'Missing keys' });
 
-      // Simple album pricing: flat ALBUM_CENTS if >= ALBUM_MIN; otherwise sum singles
       const priceCents = (arr.length >= ALBUM_MIN) ? ALBUM_CENTS : (arr.length * PRICE_SINGLE);
 
       const session = await stripe.checkout.sessions.create({
@@ -258,7 +236,7 @@ app.post('/create-checkout-session', async (req, res) => {
         }],
         success_url: `${FRONTEND_URL}/thanks.html?tier=album&count=${arr.length}&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
-        metadata: { keys: JSON.stringify(arr.slice(0, 100)) } // limited for safety
+        metadata: { keys: JSON.stringify(arr.slice(0, 100)) }
       });
 
       return res.json({ url: session.url });
@@ -272,8 +250,7 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // ---------------- Secure Download ----------------
-// GET /download?key=<S3 key>
-// Returns a short-lived signed URL to the original (no watermark).
+// GET /download?key=<S3 key>  -> returns short-lived signed URL
 app.get('/download', async (req, res) => {
   try {
     const key = req.query.key;
@@ -282,7 +259,7 @@ app.get('/download', async (req, res) => {
     const url = s3.getSignedUrl('getObject', {
       Bucket: BUCKET,
       Key: key,
-      Expires: 60 // seconds
+      Expires: 60
     });
 
     res.json({ url });
@@ -312,61 +289,57 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
 
     const results = [];
     for (const f of req.files) {
-      // inside: for (const f of req.files) { ... }
+      try {
+        // --------- HEIC/HEIF -> JPEG if needed ---------
+        let contentType = f.mimetype || 'image/jpeg';
+        let ext = mime.extension(contentType) || 'jpg';
+        let baseName = (f.originalname || `photo.${ext}`);
 
-let contentType = f.mimetype || 'image/jpeg';
-let ext = mime.extension(contentType) || 'jpg';
-let baseName = (f.originalname || `photo.${ext}`);
+        const looksHeic = /image\/heic|image\/heif/i.test(contentType) || /\.(heic|heif)$/i.test(baseName);
+        let bodyBuffer = f.buffer;
 
-// Detect HEIC/HEIF by mimetype OR filename and convert to JPEG
-const looksHeic = /image\/heic|image\/heif/i.test(contentType) || /\.(heic|heif)$/i.test(baseName);
-let bodyBuffer = f.buffer;
+        if (looksHeic) {
+          try {
+            const jpg = await sharp(f.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer();
+            bodyBuffer = jpg;
+            contentType = 'image/jpeg';
+            ext = 'jpg';
+            baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
+            console.log('[admin/upload] converted HEIC→JPEG:', baseName);
+          } catch (e) {
+            console.warn('[admin/upload] HEIC convert failed, indexing may fail:', e.message);
+          }
+        }
 
-if (looksHeic) {
-  try {
-    const jpg = await sharp(f.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer();
-    bodyBuffer = jpg;
-    contentType = 'image/jpeg';
-    ext = 'jpg';
-    baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
-    console.log('[admin/upload] converted HEIC→JPEG:', baseName);
-  } catch (e) {
-    console.warn('[admin/upload] HEIC convert failed, indexing may fail:', e.message);
-  }
-}
+        const safeName = baseName.replace(/[^\w.\-]/g, '_');
+        const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
 
-// sanitize file name (after possible conversion)
-const safeName = baseName.replace(/[^\w.\-]/g, '_');
+        // 1) Upload to S3 (private)
+        await s3.putObject({
+          Bucket: BUCKET,
+          Key: key,
+          Body: bodyBuffer,
+          ContentType: contentType,
+          ACL: 'private'
+        }).promise();
 
-// S3 key
-const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
+        // 2) Index faces (OK if none)
+        let facesIndexed = 0;
+        try {
+          const idx = await rekognition.indexFaces({
+            CollectionId: COLLECTION,
+            ExternalImageId: key,
+            Image: { S3Object: { Bucket: BUCKET, Name: key } },
+            DetectionAttributes: [],
+            MaxFaces: 15,
+            QualityFilter: 'NONE'
+          }).promise();
+          facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
+        } catch (e) {
+          console.warn('indexFaces warn:', key, e?.message);
+        }
 
-// 1) Upload to S3 (private)
-await s3.putObject({
-  Bucket: BUCKET,
-  Key: key,
-  Body: bodyBuffer,
-  ContentType: contentType,
-  ACL: 'private'
-}).promise();
-
-// 2) Index faces (OK if none)
-let facesIndexed = 0;
-try {
-  const idx = await rekognition.indexFaces({
-    CollectionId: COLLECTION,
-    ExternalImageId: key,
-    Image: { S3Object: { Bucket: BUCKET, Name: key } },
-    DetectionAttributes: [],
-    MaxFaces: 15,
-    QualityFilter: 'NONE'
-  }).promise();
-  facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
-} catch (e) {
-  console.warn('indexFaces warn:', key, e?.message);
-}
-
-results.push({ key, ok: true, facesIndexed });
+        results.push({ key, ok: true, facesIndexed });
       } catch (e) {
         console.error('admin upload item failed:', e);
         results.push({ key: null, ok: false, error: e.message });
@@ -380,7 +353,7 @@ results.push({ key, ok: true, facesIndexed });
   }
 });
 
-// ---------------- Start server ----------------
+// ---------------- Root + Start ----------------
 app.get('/', (req, res) => res.send('LastNightPix API is running'));
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
