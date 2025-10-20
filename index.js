@@ -189,6 +189,27 @@ Image: { Bytes: req.file.buffer }
     res.status(500).json({ matchFound: false, error: err.message });
   }
 });
+// Debug: POST /debug-search  (multipart form: field "image")
+app.post('/debug-search', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'no image' });
+    const out = await rekognition.searchFacesByImage({
+      CollectionId: COLLECTION,
+      FaceMatchThreshold: 70,
+      MaxFaces: 10,
+      QualityFilter: 'NONE',
+      Image: { Bytes: req.file.buffer }
+    }).promise();
+    const list = (out.FaceMatches || []).map(m => ({
+      similarity: Math.round(m.Similarity || 0),
+      key: m.Face?.ExternalImageId || null,
+      faceId: m.Face?.FaceId || null
+    }));
+    res.json({ count: list.length, results: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ---------------- Stripe Checkout ----------------
 // POST /create-checkout-session
