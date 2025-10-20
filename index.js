@@ -307,19 +307,21 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
 
         // 2) index faces (ignore if none)
         try {
-          await rekognition.indexFaces({
-            CollectionId: COLLECTION,
-            ExternalImageId: key,
-            Image: { S3Object: { Bucket: BUCKET, Name: key } },
-            DetectionAttributes: [],
-            MaxFaces: 15,
-            QualityFilter: 'AUTO'
-          }).promise();
+          const idx = await rekognition.indexFaces({
+  CollectionId: COLLECTION,
+  ExternalImageId: key,
+  Image: { S3Object: { Bucket: BUCKET, Name: key } },
+  DetectionAttributes: [],
+  MaxFaces: 15,
+  QualityFilter: 'NONE'
+}).promise();
+
+const facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
         } catch (e) {
           console.warn('indexFaces warn:', key, e?.message);
         }
 
-        results.push({ key, ok: true });
+        results.push({ key, ok: true, facesIndexed });
       } catch (e) {
         console.error('admin upload item failed:', e);
         results.push({ key: null, ok: false, error: e.message });
