@@ -2,9 +2,9 @@
 // MVP server:
 // - CORS (Netlify + local)
 // - Watermarked previews from S3
-// - Rekognition face match (selfie -> gallery)
+// - Rekognition face match (selfie -> gallery) with HEIC handling
 // - Stripe checkout (single + album)
-// - Admin bulk upload with HEIC->JPEG conversion + indexing
+// - Admin bulk upload: normalize to JPEG, resize, index; debug if 0 faces
 // ================================================================
 
 require('dotenv').config();
@@ -148,19 +148,23 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       return res.json({ matchFound: false, error: 'No image uploaded' });
     }
 
-    // HEIC/HEIF -> JPEG for selfie uploads
-    const ct = req.file.mimetype || 'image/jpeg';
-    const isHeic = /image\/heic|image\/heif/i.test(ct) || /\.(heic|heif)$/i.test(req.file.originalname || '');
-    const bytes = isHeic
-      ? await sharp(req.file.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer()
-      : req.file.buffer;
+    // Auto-rotate and normalize selfie; HEIC/HEIF -> JPEG if needed
+    const isHeic = /image\/heic|image\/heif/i.test(req.file.mimetype || '') ||
+                   /\.(heic|heif)$/i.test(req.file.originalname || '');
+    let selfie = sharp(req.file.buffer).rotate(); // EXIF auto-rotate
+    if (isHeic) {
+      selfie = selfie.toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
+    }
+    const selfieBytes = await selfie
+      .resize({ width: 3000, height: 3000, fit: 'inside', withoutEnlargement: true })
+      .toBuffer();
 
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 80,     // lowered for nightlife conditions
+      FaceMatchThreshold: 80,     // forgiving for nightlife
       MaxFaces: 50,
-      QualityFilter: 'NONE',      // don't discard in search
-      Image: { Bytes: bytes }
+      QualityFilter: 'NONE',      // do not discard
+      Image: { Bytes: selfieBytes }
     }).promise();
 
     if (!search.FaceMatches || !search.FaceMatches.length) {
@@ -290,27 +294,23 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     const results = [];
     for (const f of req.files) {
       try {
-        // --------- HEIC/HEIF -> JPEG if needed ---------
-        let contentType = f.mimetype || 'image/jpeg';
-        let ext = mime.extension(contentType) || 'jpg';
-        let baseName = (f.originalname || `photo.${ext}`);
+        // --------- Normalize to standard JPEG (auto-rotate, sRGB) ---------
+        let baseName = (f.originalname || 'photo.jpg');
+        const looksHeic = /image\/heic|image\/heif/i.test(f.mimetype || '') || /\.(heic|heif)$/i.test(baseName);
 
-        const looksHeic = /image\/heic|image\/heif/i.test(contentType) || /\.(heic|heif)$/i.test(baseName);
-        let bodyBuffer = f.buffer;
+        if (looksHeic) baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
+        else baseName = baseName.replace(/\.(jpeg|jpg|png|gif|webp|tif|tiff)$/i, '.jpg'); // normalize extension
 
-        if (looksHeic) {
-          try {
-            const jpg = await sharp(f.buffer).jpeg({ quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' }).toBuffer();
-            bodyBuffer = jpg;
-            contentType = 'image/jpeg';
-            ext = 'jpg';
-            baseName = baseName.replace(/\.(heic|heif)$/i, '.jpg');
-            console.log('[admin/upload] converted HEIC→JPEG:', baseName);
-          } catch (e) {
-            console.warn('[admin/upload] HEIC convert failed, indexing may fail:', e.message);
-          }
-        }
+        let pipeline = sharp(f.buffer).rotate(); // auto-rotate via EXIF
+        pipeline = pipeline
+          .withMetadata({ orientation: 1 }) // strip orientation after rotate
+          .resize({ width: 3000, height: 3000, fit: 'inside', withoutEnlargement: true })
+          .toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
 
+        const bodyBuffer = await pipeline.toBuffer();
+        const contentType = 'image/jpeg';
+
+        // sanitize file name
         const safeName = baseName.replace(/[^\w.\-]/g, '_');
         const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
 
@@ -331,7 +331,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
             ExternalImageId: key,
             Image: { S3Object: { Bucket: BUCKET, Name: key } },
             DetectionAttributes: [],
-            MaxFaces: 15,
+            MaxFaces: 30,
             QualityFilter: 'NONE'
           }).promise();
           facesIndexed = Array.isArray(idx.FaceRecords) ? idx.FaceRecords.length : 0;
@@ -339,7 +339,22 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           console.warn('indexFaces warn:', key, e?.message);
         }
 
-        results.push({ key, ok: true, facesIndexed });
+        // If 0 faces, run detectFaces once to report what's seen
+        let faceCountInImage = null;
+        if (facesIndexed === 0) {
+          try {
+            const det = await rekognition.detectFaces({
+              Image: { S3Object: { Bucket: BUCKET, Name: key } },
+              Attributes: ['DEFAULT']
+            }).promise();
+            faceCountInImage = Array.isArray(det.FaceDetails) ? det.FaceDetails.length : 0;
+          } catch (e) {
+            faceCountInImage = -1; // means detect failed
+            console.warn('detectFaces warn:', key, e?.message);
+          }
+        }
+
+        results.push({ key, ok: true, facesIndexed, faceCountInImage });
       } catch (e) {
         console.error('admin upload item failed:', e);
         results.push({ key: null, ok: false, error: e.message });
