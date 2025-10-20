@@ -79,9 +79,15 @@ app.use(express.urlencoded({ extended: true }));
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB/file
 
 // ---------------- Health / Version ----------------
-app.get('/version', (req, res) => {
-  const hasAdminUpload = !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload'));
-  res.json({ ok: true, ts: new Date().toISOString(), hasAdminUpload });
+app.get('/version', async (req, res) => {
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    hasAdminUpload: !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload')),
+    region: process.env.AWS_REGION,
+    bucket: process.env.BUCKET ? '(set)' : '(MISSING)',
+    collection: process.env.COLLECTION ? '(set)' : '(MISSING)'
+  });
 });
 
 // ---------------- Watermarked Preview ----------------
