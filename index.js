@@ -165,7 +165,7 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       return {
         key: s3key,
         similarity: Math.round(m.Similarity || 0),
-        imageUrl: `/preview-image?key=${encodeURIComponent(s3key)}`
+imageUrl: `https://lastnightpix-api.onrender.com/preview-image?key=${encodeURIComponent(s3key)}`
       };
     }).filter(r => r.key);
 
