@@ -1,11 +1,8 @@
 // =================== LastNightPix API (Express) ===================
-// - CORS (Netlify + local)
-// - Watermarked previews from S3
-// - Rekognition face match (selfie -> gallery) with HEIC handling
-// - Stripe checkout (single + album)
-// - Admin upload: normalize JPEG, resize, brighten, index; return unindexedReasons/indexError
-// - IMPORTANT: Rekognition ExternalImageId cannot contain "/", so we map "/" -> ":" on write,
-//              and ":" -> "/" on read.
+// - Watermarked previews for browsing
+// - Stripe checkout (single + album) with metadata.keys
+// - Post-purchase: GET /purchase/session?session_id=... -> signed HD URLs
+// - Rekognition indexing/matching (with ":" mapping for ExternalImageId)
 // ================================================================
 
 require('dotenv').config();
@@ -14,12 +11,11 @@ const cors = require('cors');
 const aws = require('aws-sdk');
 const sharp = require('sharp');
 const multer = require('multer');
-const mime = require('mime-types');
 const Stripe = require('stripe');
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://lastnightpix.netlify.app';
 const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
 const BUCKET = process.env.BUCKET;
 const COLLECTION = process.env.COLLECTION;
@@ -29,7 +25,6 @@ const PRICE_SINGLE = Number(process.env.PRICE_SINGLE || '199'); // cents
 const ALBUM_MIN = Number(process.env.ALBUM_MIN || '5');
 const ALBUM_CENTS = Number(process.env.ALBUM_CENTS || '999');
 
-// Preview / watermark tuning
 const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
 const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18');
 const WM_ANGLE = Number(process.env.WATERMARK_ANGLE || '-30');
@@ -51,7 +46,7 @@ const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 // ---------- App ----------
 const app = express();
 
-// CORS
+// CORS allow Netlify + local
 const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
   'http://127.0.0.1:3000',
@@ -71,13 +66,14 @@ app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
-// Helpers to map ExternalImageId <-> S3 key
-const keyToExternalId = (key) => (key || '').replace(/\//g, ':');   // S3 -> Rekog
-const externalIdToKey = (eid) => (eid || '').replace(/:/g, '/');    // Rekog -> S3
+// Helpers to map ExternalImageId <-> S3 key (Rekognition disallows "/")
+const keyToExternalId = (key) => (key || '').replace(/\//g, ':');
+const externalIdToKey = (eid) => (eid || '').replace(/:/g, '/');
 
-// ---------------- Health Check ----------------
+// ---------------- Health ----------------
 app.get('/version', (req, res) => {
   const hasAdminUpload = !!(app._router.stack.find(r => r.route && r.route.path === '/admin/upload'));
   res.json({
@@ -113,9 +109,12 @@ app.get('/preview-image', async (req, res) => {
           <pattern id="wm" width="${tile}" height="${tile}" patternUnits="userSpaceOnUse"
                    patternTransform="rotate(${WM_ANGLE})">
             <text x="${Math.round(tile*0.1)}" y="${Math.round(tile*0.6)}"
-                  font-family="Arial" font-size="${fontSize}"
-                  fill="#FFFFFF" fill-opacity="${WM_OPACITY}"
-                  font-weight="700">${WM_TEXT}</text>
+                  font-family="Arial, Helvetica, sans-serif"
+                  font-size="${fontSize}"
+                  fill="#FFFFFF"
+                  fill-opacity="${WM_OPACITY}"
+                  font-weight="700"
+                  letter-spacing="1">${WM_TEXT}</text>
           </pattern>
         </defs>
         <rect width="100%" height="100%" fill="url(#wm)"/>
@@ -125,10 +124,11 @@ app.get('/preview-image', async (req, res) => {
     const out = await sharp(inputBuffer)
       .resize({ width: outW })
       .composite([{ input: svgBuffer, gravity: 'center' }])
-      .jpeg({ quality: PREVIEW_JPEG_QUALITY })
+      .jpeg({ quality: PREVIEW_JPEG_QUALITY, chromaSubsampling: '4:4:4' })
       .toBuffer();
 
     res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=300');
     res.send(out);
   } catch (err) {
     console.error('preview-image failed:', err);
@@ -136,43 +136,50 @@ app.get('/preview-image', async (req, res) => {
   }
 });
 
-// ---------------- Face Match ----------------
+// ---------------- Face Match (selfie -> gallery) ----------------
 app.post('/match-gallery', upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) return res.json({ matchFound: false, error: 'No image uploaded' });
+    if (!req.file || !req.file.buffer) {
+      return res.json({ matchFound: false, error: 'No image uploaded' });
+    }
 
     const isHeic = /image\/heic|image\/heif/i.test(req.file.mimetype || '') ||
                    /\.(heic|heif)$/i.test(req.file.originalname || '');
     let selfie = sharp(req.file.buffer).rotate();
-    if (isHeic) selfie = selfie.toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
+    if (isHeic) {
+      selfie = selfie.toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
+    }
     const selfieBytes = await selfie
       .resize({ width: 3000, height: 3000, fit: 'inside', withoutEnlargement: true })
       .toBuffer();
 
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 75,   // forgiving for nightlife/testing
+      FaceMatchThreshold: 75,     // a bit forgiving for nightlife lighting
       MaxFaces: 50,
       QualityFilter: 'NONE',
-      Image: { Bytes: selfieBytes },
+      Image: { Bytes: selfieBytes }
     }).promise();
 
-    const matches = search.FaceMatches || [];
-    // Convert ExternalImageId back to real S3 key
-    const results = matches.map(m => {
-      const eid = m.Face?.ExternalImageId || '';
-      const s3key = externalIdToKey(eid);
-      return {
-        key: s3key,
-        similarity: Math.round(m.Similarity || 0),
-imageUrl: `https://lastnightpix-api.onrender.com/preview-image?key=${encodeURIComponent(s3key)}`
-      };
-    }).filter(r => r.key);
+    if (!search.FaceMatches || !search.FaceMatches.length) {
+      return res.json({ matchFound: false, results: [] });
+    }
 
-    // De-dupe by key and sort
+    const results = [];
+    for (const m of search.FaceMatches) {
+      const eid = m.Face?.ExternalImageId || '';
+      const key = externalIdToKey(eid);
+      if (!key) continue;
+      results.push({
+        key,
+        similarity: Math.round(m.Similarity || 0),
+        imageUrl: `/preview-image?key=${encodeURIComponent(key)}`
+      });
+    }
+
     const seen = new Set();
-    const unique = results.filter(r => !seen.has(r.key) && seen.add(r.key));
-    unique.sort((a,b) => b.similarity - a.similarity);
+    const unique = results.filter(r => (r.key && !seen.has(r.key) && seen.add(r.key)));
+    unique.sort((a,b) => (b.similarity - a.similarity));
 
     res.json({ matchFound: unique.length > 0, results: unique });
   } catch (err) {
@@ -187,6 +194,7 @@ app.post('/create-checkout-session', async (req, res) => {
     if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
 
     const { tier, key, keys } = req.body || {};
+
     if (tier === 'single') {
       if (!key) return res.status(400).json({ error: 'Missing key' });
       const session = await stripe.checkout.sessions.create({
@@ -199,8 +207,10 @@ app.post('/create-checkout-session', async (req, res) => {
           },
           quantity: 1
         }],
-        success_url: `${FRONTEND_URL}/thanks.html?tier=single&key=${encodeURIComponent(key)}&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`
+        success_url: `${FRONTEND_URL}/thanks.html?tier=single&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
+        // Store purchased key in metadata for retrieval on thanks page
+        metadata: { keys: JSON.stringify([key]) }
       });
       return res.json({ url: session.url });
     }
@@ -219,7 +229,7 @@ app.post('/create-checkout-session', async (req, res) => {
           },
           quantity: 1
         }],
-        success_url: `${FRONTEND_URL}/thanks.html?tier=album&count=${arr.length}&session_id={CHECKOUT_SESSION_ID}`,
+        success_url: `${FRONTEND_URL}/thanks.html?tier=album&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
         metadata: { keys: JSON.stringify(arr.slice(0, 100)) }
       });
@@ -233,29 +243,52 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ---------------- Secure Download ----------------
-app.get('/download', async (req, res) => {
+// ---------------- Post-purchase: return signed HD URLs ----------------
+// GET /purchase/session?session_id=cs_test_123
+app.get('/purchase/session', async (req, res) => {
   try {
-    const key = req.query.key;
-    if (!key) return res.status(400).json({ error: 'Missing key' });
+    if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
 
-    const url = s3.getSignedUrl('getObject', {
-      Bucket: BUCKET,
-      Key: key,
-      Expires: 60
-    });
+    const session_id = req.query.session_id;
+    if (!session_id) return res.status(400).json({ ok: false, error: 'Missing session_id' });
 
-    res.json({ url });
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (!session || session.payment_status !== 'paid') {
+      return res.status(403).json({ ok: false, error: 'Session not paid' });
+    }
+
+    let keys = [];
+    try {
+      const meta = session.metadata || {};
+      keys = JSON.parse(meta.keys || '[]');
+    } catch {
+      keys = [];
+    }
+    if (!Array.isArray(keys) || !keys.length) {
+      return res.status(400).json({ ok: false, error: 'No purchased keys found' });
+    }
+
+    // Return short-lived signed S3 URLs for original files (no watermark)
+    const items = keys.map(k => ({
+      key: k,
+      url: s3.getSignedUrl('getObject', {
+        Bucket: BUCKET,
+        Key: k,
+        Expires: 60, // seconds
+        ResponseContentDisposition: `attachment; filename="${k.split('/').pop() || 'photo.jpg'}"`
+      })
+    }));
+
+    res.json({ ok: true, count: items.length, items });
   } catch (err) {
-    console.error('download failed:', err);
-    res.status(500).json({ error: 'download failed: ' + err.message });
+    console.error('purchase/session failed:', err);
+    res.status(500).json({ ok: false, error: 'purchase/session failed: ' + err.message });
   }
 });
 
-// ---------------- Admin Upload ----------------
+// ---------------- Admin Bulk Upload + Index ----------------
 app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
   try {
-    // auth
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     if (!token || token !== ADMIN_TOKEN) {
@@ -303,7 +336,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
         try {
           const idx = await rekognition.indexFaces({
             CollectionId: COLLECTION,
-            ExternalImageId: externalId,            // <-- no "/"
+            ExternalImageId: externalId,
             Image: { S3Object: { Bucket: BUCKET, Name: key } },
             DetectionAttributes: [],
             MaxFaces: 30,
