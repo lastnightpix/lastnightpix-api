@@ -88,7 +88,7 @@ app.get('/version', (req, res) => {
   });
 });
 
-// ---------------- Watermarked Preview (simple, safe) ----------------
+// ---------------- Watermarked Preview (centered watermark) ----------------
 app.get('/preview-image', async (req, res) => {
   const key = req.query.key;
   if (!key) return res.status(400).send('Missing key');
@@ -97,23 +97,28 @@ app.get('/preview-image', async (req, res) => {
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
     const original = obj.Body;
 
-    // resize to something reasonable so people don't get full-res for free
+    // Resize to your preview width to discourage full-res screenshots
     const base = sharp(original).resize({
-      width: PREVIEW_MAX_W, // from your env, default 1200
+      width: PREVIEW_MAX_W,
       withoutEnlargement: true,
     });
 
-    // we need the size to draw the bar
+    // Grab dimensions for SVG
     const { width, height } = await base.metadata();
     const w = width || 1200;
     const h = height || 800;
 
-    // simple svg bar at bottom with your text
+    // Central watermark SVG — slightly transparent so the photo is still visible
     const svg = `
       <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-        <rect x="0" y="${h - 90}" width="${w}" height="90" fill="black" fill-opacity="0.45" />
-        <text x="50%" y="${h - 35}" font-size="34" fill="white" text-anchor="middle"
-          font-family="Arial, Helvetica, sans-serif">
+        <text x="50%" y="50%" text-anchor="middle"
+          font-family="Arial, Helvetica, sans-serif"
+          font-size="${Math.round(w / 10)}"
+          fill="white"
+          fill-opacity="0.25"
+          stroke="black"
+          stroke-width="3"
+          dominant-baseline="middle">
           ${WM_TEXT}
         </text>
       </svg>
@@ -145,7 +150,6 @@ app.get('/preview-image', async (req, res) => {
     }
   }
 });
-
 // ---------------- Face Match (selfie -> gallery) ----------------
 app.post('/match-gallery', upload.single('image'), async (req, res) => {
   try {
