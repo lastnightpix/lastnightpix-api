@@ -88,23 +88,61 @@ app.get('/version', (req, res) => {
   });
 });
 
-// ---------------- Watermarked Preview (temporary no-transform) ----------------
+// ---------------- Watermarked Preview (simple, safe) ----------------
 app.get('/preview-image', async (req, res) => {
   const key = req.query.key;
   if (!key) return res.status(400).send('Missing key');
-  try {
-    const obj = await s3.getObject({
-      Bucket: BUCKET,
-      Key: key,
-    }).promise();
 
-    // just send it as-is
-    res.setHeader('Content-Type', obj.ContentType || 'image/jpeg');
+  try {
+    const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
+    const original = obj.Body;
+
+    // resize to something reasonable so people don't get full-res for free
+    const base = sharp(original).resize({
+      width: PREVIEW_MAX_W, // from your env, default 1200
+      withoutEnlargement: true,
+    });
+
+    // we need the size to draw the bar
+    const { width, height } = await base.metadata();
+    const w = width || 1200;
+    const h = height || 800;
+
+    // simple svg bar at bottom with your text
+    const svg = `
+      <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="${h - 90}" width="${w}" height="90" fill="black" fill-opacity="0.45" />
+        <text x="50%" y="${h - 35}" font-size="34" fill="white" text-anchor="middle"
+          font-family="Arial, Helvetica, sans-serif">
+          ${WM_TEXT}
+        </text>
+      </svg>
+    `;
+
+    const watermarked = await base
+      .composite([
+        {
+          input: Buffer.from(svg),
+          top: 0,
+          left: 0,
+        },
+      ])
+      .jpeg({ quality: PREVIEW_JPEG_QUALITY, chromaSubsampling: '4:4:4' })
+      .toBuffer();
+
+    res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=300');
-    return res.send(obj.Body);
+    return res.send(watermarked);
   } catch (err) {
-    console.error('preview-image (raw) failed:', err);
-    return res.status(500).send('Could not load image');
+    console.error('preview-image watermark failed, sending original:', err);
+    try {
+      const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
+      res.setHeader('Content-Type', obj.ContentType || 'image/jpeg');
+      return res.send(obj.Body);
+    } catch (inner) {
+      console.error('preview-image fallback failed:', inner);
+      return res.status(500).send('Could not load image');
+    }
   }
 });
 
