@@ -24,6 +24,8 @@ const STRIPE_SECRET = process.env.STRIPE_SECRET || '';
 const PRICE_SINGLE = Number(process.env.PRICE_SINGLE || '199'); // cents
 const ALBUM_MIN = Number(process.env.ALBUM_MIN || '5');
 const ALBUM_CENTS = Number(process.env.ALBUM_CENTS || '999');
+const API_BASE = process.env.API_BASE || 'https://lastnightpix-api.onrender.com';
+
 
 const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
 const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18');
