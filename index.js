@@ -140,11 +140,12 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       const eid = m.Face?.ExternalImageId || '';
       const key = externalIdToKey(eid);
       if (!key) continue;
-      results.push({
-        key,
-        similarity: Math.round(m.Similarity || 0),
-        imageUrl: `/preview-image?key=${encodeURIComponent(key)}`
-      });
+      const API_BASE = process.env.API_BASE || 'https://lastnightpix-api.onrender.com';
+results.push({
+  key,
+  similarity: Math.round(m.Similarity || 0),
+  imageUrl: `${API_BASE}/preview-image?key=${encodeURIComponent(key)}`
+});
     }
 
     const seen = new Set();
