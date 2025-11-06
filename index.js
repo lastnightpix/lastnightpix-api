@@ -86,69 +86,23 @@ app.get('/version', (req, res) => {
   });
 });
 
-// ---------------- Watermarked Preview (safer) ----------------
+// ---------------- Watermarked Preview (temporary no-transform) ----------------
 app.get('/preview-image', async (req, res) => {
   const key = req.query.key;
   if (!key) return res.status(400).send('Missing key');
-
   try {
-    // 1. get original from S3
-    const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
-    const original = obj.Body;
+    const obj = await s3.getObject({
+      Bucket: BUCKET,
+      Key: key,
+    }).promise();
 
-    // 2. try to read metadata, but fall back to safe sizes
-    let meta;
-    try {
-      meta = await sharp(original).metadata();
-    } catch (e) {
-      meta = {};
-    }
-
-    const baseW = meta.width && meta.width > 0 ? meta.width : PREVIEW_MAX_W;
-    const outW = Math.min(baseW, PREVIEW_MAX_W);
-    const outH = meta.height
-      ? Math.round((meta.height / meta.width) * outW)
-      : Math.round(outW * 0.6);
-
-    // 3. simple, non-tiled watermark to avoid black frames
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="${outW}" height="${outH}">
-        <rect x="0" y="${outH - 80}" width="${outW}" height="80" fill="black" fill-opacity="0.35" />
-        <text x="50%" y="${outH - 30}" text-anchor="middle"
-          font-family="Arial, Helvetica, sans-serif"
-          font-size="32"
-          fill="white">
-          ${WM_TEXT}
-        </text>
-      </svg>
-    `;
-
-    const watermarked = await sharp(original)
-      .resize({ width: outW, withoutEnlargement: true })
-      .composite([
-        {
-          input: Buffer.from(svg),
-          top: 0,
-          left: 0,
-        },
-      ])
-      .jpeg({ quality: PREVIEW_JPEG_QUALITY, chromaSubsampling: '4:4:4' })
-      .toBuffer();
-
-    res.setHeader('Content-Type', 'image/jpeg');
+    // just send it as-is
+    res.setHeader('Content-Type', obj.ContentType || 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=300');
-    return res.send(watermarked);
+    return res.send(obj.Body);
   } catch (err) {
-    console.error('preview-image failed, sending original:', err);
-    // fallback: just send the original so the frontend never shows a black square
-    try {
-      const obj2 = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
-      res.setHeader('Content-Type', obj2.ContentType || 'image/jpeg');
-      return res.send(obj2.Body);
-    } catch (inner) {
-      console.error('preview-image fallback failed:', inner);
-      return res.status(500).send('Could not load image');
-    }
+    console.error('preview-image (raw) failed:', err);
+    return res.status(500).send('Could not load image');
   }
 });
 
