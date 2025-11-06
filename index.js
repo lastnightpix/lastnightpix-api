@@ -383,3 +383,33 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
 // ---------------- Root ----------------
 app.get('/', (req, res) => res.send('LastNightPix API is running'));
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+// === STRIPE WEBHOOK ===
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('❌ Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const items = session.metadata?.keys?.split(',') || [];
+    for (const key of items) {
+      try {
+        // Move the file from "watermarked" folder to "clean" folder
+        const srcKey = `watermarked/${key}`;
+        const destKey = `clean/${key}`;
+        await s3.copyObject({ Bucket: BUCKET, CopySource: `${BUCKET}/${srcKey}`, Key: destKey, ACL: 'public-read' }).promise();
+        console.log(`✅ Moved ${key} to clean folder`);
+      } catch (err) {
+        console.error('Error moving after purchase', key, err);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
