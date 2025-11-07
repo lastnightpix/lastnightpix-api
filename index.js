@@ -3,6 +3,7 @@
 // - Stripe checkout (single + album) with metadata.keys
 // - Post-purchase: GET /purchase/session?session_id=... -> signed HD URLs
 // - Rekognition indexing/matching (with ":" mapping for ExternalImageId)
+// - Admin stats endpoint for dashboard
 // ================================================================
 
 require('dotenv').config();
@@ -26,10 +27,7 @@ const ALBUM_MIN = Number(process.env.ALBUM_MIN || '5');
 const ALBUM_CENTS = Number(process.env.ALBUM_CENTS || '999');
 const API_BASE = process.env.API_BASE || 'https://lastnightpix-api.onrender.com';
 
-
 const WM_TEXT = process.env.WATERMARK_TEXT || 'LastNightPix.com • PREVIEW';
-const WM_OPACITY = Number(process.env.WATERMARK_OPACITY || '0.18');
-const WM_ANGLE = Number(process.env.WATERMARK_ANGLE || '-30');
 const PREVIEW_MAX_W = Number(process.env.PREVIEW_MAX_W || '1200');
 const PREVIEW_JPEG_QUALITY = Number(process.env.PREVIEW_JPEG_QUALITY || '80');
 
@@ -61,8 +59,8 @@ app.use(cors({
     if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(null, false);
   },
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.options('*', cors());
 
@@ -88,7 +86,7 @@ app.get('/version', (req, res) => {
   });
 });
 
-// ---------------- Watermarked Preview (centered watermark) ----------------
+// ---------------- Watermarked Preview (centered) ----------------
 app.get('/preview-image', async (req, res) => {
   const key = req.query.key;
   if (!key) return res.status(400).send('Missing key');
@@ -97,18 +95,17 @@ app.get('/preview-image', async (req, res) => {
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
     const original = obj.Body;
 
-    // Resize to your preview width to discourage full-res screenshots
+    // resize to preview width
     const base = sharp(original).resize({
       width: PREVIEW_MAX_W,
       withoutEnlargement: true,
     });
 
-    // Grab dimensions for SVG
-    const { width, height } = await base.metadata();
-    const w = width || 1200;
-    const h = height || 800;
+    const meta = await base.metadata();
+    const w = meta.width || 1200;
+    const h = meta.height || 800;
 
-    // Central watermark SVG — slightly transparent so the photo is still visible
+    // center watermark
     const svg = `
       <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
         <text x="50%" y="50%" text-anchor="middle"
@@ -141,15 +138,16 @@ app.get('/preview-image', async (req, res) => {
   } catch (err) {
     console.error('preview-image watermark failed, sending original:', err);
     try {
-      const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
-      res.setHeader('Content-Type', obj.ContentType || 'image/jpeg');
-      return res.send(obj.Body);
+      const obj2 = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
+      res.setHeader('Content-Type', obj2.ContentType || 'image/jpeg');
+      return res.send(obj2.Body);
     } catch (inner) {
       console.error('preview-image fallback failed:', inner);
       return res.status(500).send('Could not load image');
     }
   }
 });
+
 // ---------------- Face Match (selfie -> gallery) ----------------
 app.post('/match-gallery', upload.single('image'), async (req, res) => {
   try {
@@ -158,7 +156,7 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
     }
 
     const isHeic = /image\/heic|image\/heif/i.test(req.file.mimetype || '') ||
-                   /\.(heic|heif)$/i.test(req.file.originalname || '');
+      /\.(heic|heif)$/i.test(req.file.originalname || '');
     let selfie = sharp(req.file.buffer).rotate();
     if (isHeic) {
       selfie = selfie.toFormat('jpeg', { quality: 92, mozjpeg: true, chromaSubsampling: '4:4:4' });
@@ -169,7 +167,7 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
 
     const search = await rekognition.searchFacesByImage({
       CollectionId: COLLECTION,
-      FaceMatchThreshold: 75,     // a bit forgiving for nightlife lighting
+      FaceMatchThreshold: 75,
       MaxFaces: 50,
       QualityFilter: 'NONE',
       Image: { Bytes: selfieBytes }
@@ -184,17 +182,16 @@ app.post('/match-gallery', upload.single('image'), async (req, res) => {
       const eid = m.Face?.ExternalImageId || '';
       const key = externalIdToKey(eid);
       if (!key) continue;
-      const API_BASE = process.env.API_BASE || 'https://lastnightpix-api.onrender.com';
-results.push({
-  key,
-  similarity: Math.round(m.Similarity || 0),
-  imageUrl: `${API_BASE}/preview-image?key=${encodeURIComponent(key)}`
-});
+      results.push({
+        key,
+        similarity: Math.round(m.Similarity || 0),
+        imageUrl: `${API_BASE}/preview-image?key=${encodeURIComponent(key)}`
+      });
     }
 
     const seen = new Set();
     const unique = results.filter(r => (r.key && !seen.has(r.key) && seen.add(r.key)));
-    unique.sort((a,b) => (b.similarity - a.similarity));
+    unique.sort((a, b) => (b.similarity - a.similarity));
 
     res.json({ matchFound: unique.length > 0, results: unique });
   } catch (err) {
@@ -224,7 +221,6 @@ app.post('/create-checkout-session', async (req, res) => {
         }],
         success_url: `${FRONTEND_URL}/thanks.html?tier=single&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${FRONTEND_URL}/find-gallery.html?cancel=1`,
-        // Store purchased key in metadata for retrieval on thanks page
         metadata: { keys: JSON.stringify([key]) }
       });
       return res.json({ url: session.url });
@@ -259,7 +255,6 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // ---------------- Post-purchase: return signed HD URLs ----------------
-// GET /purchase/session?session_id=cs_test_123
 app.get('/purchase/session', async (req, res) => {
   try {
     if (!stripe) throw new Error('Stripe not configured: missing STRIPE_SECRET env var');
@@ -283,7 +278,6 @@ app.get('/purchase/session', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'No purchased keys found' });
     }
 
-    // Return short-lived signed S3 URLs for original files (no watermark)
     const items = keys.map(k => ({
       key: k,
       url: s3.getSignedUrl('getObject', {
@@ -294,7 +288,14 @@ app.get('/purchase/session', async (req, res) => {
       })
     }));
 
-    res.json({ ok: true, count: items.length, items });
+    const buyerEmail = session.customer_details?.email || null;
+
+    res.json({
+      ok: true,
+      email: buyerEmail,
+      count: items.length,
+      items
+    });
   } catch (err) {
     console.error('purchase/session failed:', err);
     res.status(500).json({ ok: false, error: 'purchase/session failed: ' + err.message });
@@ -316,11 +317,11 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     const results = [];
     for (const f of req.files) {
       try {
-        // Normalize to JPEG (auto-rotate, resize, slight brighten)
+        // Normalize to JPEG
         let baseName = (f.originalname || 'photo.jpg');
         const looksHeic = /image\/heic|image\/heif/i.test(f.mimetype || '') || /\.(heic|heif)$/i.test(baseName);
         baseName = looksHeic ? baseName.replace(/\.(heic|heif)$/i, '.jpg')
-                             : baseName.replace(/\.(jpeg|jpg|png|gif|webp|tif|tiff)$/i, '.jpg');
+          : baseName.replace(/\.(jpeg|jpg|png|gif|webp|tif|tiff)$/i, '.jpg');
 
         let pipeline = sharp(f.buffer).rotate()
           .withMetadata({ orientation: 1 })
@@ -333,7 +334,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
         const safeName = baseName.replace(/[^\w.\-]/g, '_');
         const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
 
-        // 1) Upload to S3 (private)
+        // 1) Upload to S3
         await s3.putObject({
           Bucket: BUCKET,
           Key: key,
@@ -342,7 +343,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           ACL: 'private'
         }).promise();
 
-        // 2) Index faces (map key -> ExternalImageId with ":" instead of "/")
+        // 2) Index faces
         const externalId = keyToExternalId(key);
         let facesIndexed = 0;
         let unindexedReasons = [];
@@ -367,7 +368,7 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           console.warn('indexFaces warn:', key, indexError);
         }
 
-        // If 0 faces, also report detectFaces count
+        // 3) Detect faces if index returned 0
         let faceCountInImage = null;
         if (facesIndexed === 0) {
           try {
@@ -394,9 +395,8 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     res.status(500).json({ success: false, error: 'admin upload failed: ' + err.message });
   }
 });
+
 // ---------------- Admin Stats ----------------
-// GET /admin/stats
-// headers: Authorization: Bearer <ADMIN_TOKEN>
 app.get('/admin/stats', async (req, res) => {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
@@ -405,7 +405,6 @@ app.get('/admin/stats', async (req, res) => {
   }
 
   try {
-    // count S3 event photos
     const list = await s3.listObjectsV2({
       Bucket: BUCKET,
       Prefix: 'event-photos/'
@@ -413,7 +412,6 @@ app.get('/admin/stats', async (req, res) => {
 
     const totalPhotos = (list.Contents || []).length;
 
-    // count faces in Rekognition collection
     const faces = await rekognition.listFaces({
       CollectionId: COLLECTION,
       MaxResults: 1000
@@ -437,34 +435,30 @@ app.get('/admin/stats', async (req, res) => {
 
 // ---------------- Root ----------------
 app.get('/', (req, res) => res.send('LastNightPix API is running'));
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
-// === STRIPE WEBHOOK ===
+
+// ---------------- Stripe Webhook (logs buyer email) ----------------
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) {
+    return res.status(400).send('Stripe not configured');
+  }
   const sig = req.headers['stripe-signature'];
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('❌ Webhook signature verification failed:', err.message);
+    console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const items = session.metadata?.keys?.split(',') || [];
-    for (const key of items) {
-      try {
-        // Move the file from "watermarked" folder to "clean" folder
-        const srcKey = `watermarked/${key}`;
-        const destKey = `clean/${key}`;
-        await s3.copyObject({ Bucket: BUCKET, CopySource: `${BUCKET}/${srcKey}`, Key: destKey, ACL: 'public-read' }).promise();
-        console.log(`✅ Moved ${key} to clean folder`);
-      } catch (err) {
-        console.error('Error moving after purchase', key, err);
-      }
-    }
+    const email = session.customer_details?.email;
+    console.log('✅ Stripe checkout completed from:', email);
+    // later: generate signed URLs here and email them via SES
   }
 
   res.json({ received: true });
 });
 
+// ---------------- Listen ----------------
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
