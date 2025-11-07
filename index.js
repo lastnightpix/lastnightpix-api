@@ -394,6 +394,46 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     res.status(500).json({ success: false, error: 'admin upload failed: ' + err.message });
   }
 });
+// ---------------- Admin Stats ----------------
+// GET /admin/stats
+// headers: Authorization: Bearer <ADMIN_TOKEN>
+app.get('/admin/stats', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+
+  try {
+    // count S3 event photos
+    const list = await s3.listObjectsV2({
+      Bucket: BUCKET,
+      Prefix: 'event-photos/'
+    }).promise();
+
+    const totalPhotos = (list.Contents || []).length;
+
+    // count faces in Rekognition collection
+    const faces = await rekognition.listFaces({
+      CollectionId: COLLECTION,
+      MaxResults: 1000
+    }).promise();
+
+    const totalFaces = (faces.Faces || []).length;
+
+    return res.json({
+      ok: true,
+      bucket: BUCKET,
+      collection: COLLECTION,
+      totalPhotos,
+      totalFaces,
+      ts: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('admin/stats failed:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // ---------------- Root ----------------
 app.get('/', (req, res) => res.send('LastNightPix API is running'));
