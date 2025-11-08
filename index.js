@@ -1,9 +1,10 @@
 // =================== LastNightPix API (Express) ===================
-// - Watermarked previews for browsing
+// - Watermarked previews (centered) for browsing
 // - Stripe checkout (single + album) with metadata.keys
-// - Post-purchase: GET /purchase/session?session_id=... -> signed HD URLs
-// - Rekognition indexing/matching (with ":" mapping for ExternalImageId)
-// - Admin stats endpoint for dashboard
+// - Post-purchase: /purchase/session -> signed HD URLs (+ buyer email)
+// - Rekognition indexing/matching (":" mapping for ExternalImageId)
+// - Admin stats endpoint
+// - Stripe webhook at TOP (raw) to avoid body-parser issues
 // ================================================================
 
 require('dotenv').config();
@@ -13,6 +14,8 @@ const aws = require('aws-sdk');
 const sharp = require('sharp');
 const multer = require('multer');
 const Stripe = require('stripe');
+
+const app = express();
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
@@ -43,10 +46,87 @@ const rekognition = new aws.Rekognition();
 // ---------- Stripe ----------
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 
-// ---------- App ----------
-const app = express();
+// ===================================================================
+// 1) STRIPE WEBHOOK MUST BE BEFORE body parsers (uses express.raw)
+// ===================================================================
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) return res.status(400).send('Stripe not configured');
 
-// CORS allow Netlify + local
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // we only care about completed checkouts
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const customerEmail = session.customer_details?.email;
+    let keys = [];
+    try {
+      keys = JSON.parse(session.metadata?.keys || '[]');
+    } catch {
+      keys = [];
+    }
+
+    console.log('✅ Stripe purchase from:', customerEmail, 'keys:', keys);
+
+    // generate download links
+    const downloadItems = (keys || []).map(k => ({
+      key: k,
+      url: s3.getSignedUrl('getObject', {
+        Bucket: BUCKET,
+        Key: k,
+        Expires: 60 * 30, // 30 minutes for email
+        ResponseContentDisposition: `attachment; filename="${k.split('/').pop() || 'photo.jpg'}"`
+      })
+    }));
+
+    // send via SES if configured
+    const SES_FROM = process.env.SES_FROM;
+    if (customerEmail && SES_FROM && downloadItems.length) {
+      const ses = new aws.SES({ region: AWS_REGION });
+      const bodyLines = [
+        'Thanks for purchasing your photos from LastNightPix!',
+        '',
+        'Your download links (valid ~30 minutes):',
+        ...downloadItems.map(i => `- ${i.url}`),
+        '',
+        'If a link expires, you can return to the site and fetch your purchase again.'
+      ];
+      try {
+        await ses.sendEmail({
+          Source: SES_FROM,
+          Destination: { ToAddresses: [customerEmail] },
+          Message: {
+            Subject: { Data: 'Your LastNightPix photos' },
+            Body: { Text: { Data: bodyLines.join('\n') } }
+          }
+        }).promise();
+        console.log('📧 Email sent to', customerEmail);
+      } catch (e) {
+        console.error('Error sending SES email:', e);
+      }
+    } else {
+      console.log('Skipping email (missing SES_FROM or email or keys)');
+    }
+  }
+
+  // tell Stripe we handled it
+  res.json({ received: true });
+});
+
+// ===================================================================
+// 2) NOW add normal middleware (JSON, CORS, etc.)
+// ===================================================================
+
 const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
   'http://127.0.0.1:3000',
@@ -54,6 +134,7 @@ const ALLOWED_ORIGINS = new Set([
   'https://lastnightpix.netlify.app',
   'https://lastnightpix.netlify.app/',
 ]);
+
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
@@ -64,14 +145,19 @@ app.use(cors({
 }));
 app.options('*', cors());
 
+// after webhook so it doesn't eat the raw body
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
-// Helpers to map ExternalImageId <-> S3 key (Rekognition disallows "/")
+// helpers
 const keyToExternalId = (key) => (key || '').replace(/\//g, ':');
 const externalIdToKey = (eid) => (eid || '').replace(/:/g, '/');
+
+// ===================================================================
+// ROUTES
+// ===================================================================
 
 // ---------------- Health ----------------
 app.get('/version', (req, res) => {
@@ -95,7 +181,6 @@ app.get('/preview-image', async (req, res) => {
     const obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
     const original = obj.Body;
 
-    // resize to preview width
     const base = sharp(original).resize({
       width: PREVIEW_MAX_W,
       withoutEnlargement: true,
@@ -105,7 +190,6 @@ app.get('/preview-image', async (req, res) => {
     const w = meta.width || 1200;
     const h = meta.height || 800;
 
-    // center watermark
     const svg = `
       <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
         <text x="50%" y="50%" text-anchor="middle"
@@ -122,13 +206,7 @@ app.get('/preview-image', async (req, res) => {
     `;
 
     const watermarked = await base
-      .composite([
-        {
-          input: Buffer.from(svg),
-          top: 0,
-          left: 0,
-        },
-      ])
+      .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
       .jpeg({ quality: PREVIEW_JPEG_QUALITY, chromaSubsampling: '4:4:4' })
       .toBuffer();
 
@@ -136,7 +214,7 @@ app.get('/preview-image', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=300');
     return res.send(watermarked);
   } catch (err) {
-    console.error('preview-image watermark failed, sending original:', err);
+    console.error('preview-image failed, fallback to original:', err);
     try {
       const obj2 = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
       res.setHeader('Content-Type', obj2.ContentType || 'image/jpeg');
@@ -317,7 +395,6 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
     const results = [];
     for (const f of req.files) {
       try {
-        // Normalize to JPEG
         let baseName = (f.originalname || 'photo.jpg');
         const looksHeic = /image\/heic|image\/heif/i.test(f.mimetype || '') || /\.(heic|heif)$/i.test(baseName);
         baseName = looksHeic ? baseName.replace(/\.(heic|heif)$/i, '.jpg')
@@ -334,7 +411,6 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
         const safeName = baseName.replace(/[^\w.\-]/g, '_');
         const key = `event-photos/${eventCode}/${Date.now()}-${safeName}`;
 
-        // 1) Upload to S3
         await s3.putObject({
           Bucket: BUCKET,
           Key: key,
@@ -343,7 +419,6 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           ACL: 'private'
         }).promise();
 
-        // 2) Index faces
         const externalId = keyToExternalId(key);
         let facesIndexed = 0;
         let unindexedReasons = [];
@@ -368,7 +443,6 @@ app.post('/admin/upload', upload.array('photos', 200), async (req, res) => {
           console.warn('indexFaces warn:', key, indexError);
         }
 
-        // 3) Detect faces if index returned 0
         let faceCountInImage = null;
         if (facesIndexed === 0) {
           try {
@@ -435,30 +509,6 @@ app.get('/admin/stats', async (req, res) => {
 
 // ---------------- Root ----------------
 app.get('/', (req, res) => res.send('LastNightPix API is running'));
-
-// ---------------- Stripe Webhook (logs buyer email) ----------------
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe) {
-    return res.status(400).send('Stripe not configured');
-  }
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const email = session.customer_details?.email;
-    console.log('✅ Stripe checkout completed from:', email);
-    // later: generate signed URLs here and email them via SES
-  }
-
-  res.json({ received: true });
-});
 
 // ---------------- Listen ----------------
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
